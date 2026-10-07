@@ -1,4 +1,5 @@
 import { connectRoom } from "./live-room.js";
+import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, encryptMessage, decryptMessage, encryptAttachment, decryptAttachment } from "./encryption.js";
 
 /* DropChat's small client: URL state, REST room lifecycle, uploads, and live messages. */
 (() => {
@@ -31,10 +32,20 @@ import { connectRoom } from "./live-room.js";
   const uploadPercent = document.getElementById("upload-percent");
   const uploadProgress = document.getElementById("upload-progress");
   const cancelUploadButton = document.getElementById("cancel-upload");
+  const deleteButton = document.getElementById("delete-room");
+  const deleteDialog = document.getElementById("delete-dialog");
+  const confirmDelete = document.getElementById("confirm-delete");
+  const cancelDelete = document.getElementById("cancel-delete");
+  const deleteError = document.getElementById("delete-error");
+  let deleting = false;
   const toast = document.getElementById("toast");
 
   const MAX_FILE_SIZE = 25 * 1024 * 1024;
   let roomId = null;
+  let roomKey = null;
+  let roomAccess = null;
+  let receiveQueue = Promise.resolve();
+  const decryptedUrls = new Set();
   let displayName = "";
   let participantId = "";
   let generation = 0;
@@ -68,7 +79,18 @@ import { connectRoom } from "./live-room.js";
     if (secondsLeft === 0) showExpired();
   }
 
+  function updateViewport() {
+    document.documentElement.style.setProperty('--chat-viewport-height', `${window.visualViewport?.height || window.innerHeight}px`);
+    document.documentElement.style.setProperty('--chat-viewport-top', `${window.visualViewport?.offsetTop || 0}px`);
+  }
+  window.addEventListener('resize', updateViewport);
+  window.visualViewport?.addEventListener('resize', updateViewport);
+  window.visualViewport?.addEventListener('scroll', updateViewport);
+  updateViewport();
+
   function showState(view) {
+    document.body.classList.toggle('is-chat-room', view === 'room');
+    updateViewport();
     homeView.classList.toggle("is-hidden", view !== "home");
     roomView.classList.toggle("is-hidden", view !== "room");
     expiredView.classList.toggle("is-hidden", view !== "expired");
@@ -83,7 +105,9 @@ import { connectRoom } from "./live-room.js";
 
   async function apiRequest(url, options = {}) {
     const requestGeneration = generation;
-    const response = await fetch(url, options);
+    const headers = new Headers(options.headers);
+    if (roomAccess && /\/(messages|uploads|files)(\/|$)/.test(url)) headers.set("X-Room-Access", roomAccess);
+    const response = await fetch(url, { ...options, headers });
     if (response.status === 404 && generation === requestGeneration && roomId && url.includes(`/api/rooms/${roomId}`)) {
       showExpired();
       throw new Error("This room has expired.");
@@ -105,9 +129,11 @@ import { connectRoom } from "./live-room.js";
     createButton.querySelector("span:first-child").textContent = "Making your room…";
     homeStatus.textContent = "A moment while we set things up.";
     try {
-      const room = await apiRequest("/api/rooms", { method: "POST" });
+      const secret = generateRoomSecret();
+      const keyCommitment = await roomCommitment(secret);
+      const room = await apiRequest("/api/rooms", { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ encryptionVersion: 1, keyCommitment }) });
       if (!room.roomId) throw new Error("The server did not return a room link.");
-      history.pushState({}, "", `/?room=${encodeURIComponent(room.roomId)}`);
+      history.pushState({}, "", `/?room=${encodeURIComponent(room.roomId)}#key=${secret}`);
       await openRoom(room.roomId, room);
     } catch (error) {
       homeStatus.textContent = error.message || "Could not create a room. Please try again.";
@@ -139,6 +165,18 @@ import { connectRoom } from "./live-room.js";
       // Always re-check the room: cached create data is not proof it remains open.
       const room = await apiRequest(`/api/rooms/${encodeURIComponent(id)}`);
       if (generation !== currentGeneration) return;
+      if (room.encryptionVersion !== 1) { showRoomIssue('This room predates encryption. Create a new room to start an encrypted conversation.'); return; }
+      const secret = new URLSearchParams(location.hash.slice(1)).get('key');
+      if (!secret) { showRoomIssue('This invite is missing its encryption key. Ask someone in the room to share the complete invite link, including the part after #.'); return; }
+      try {
+        if (await roomCommitment(secret) !== room.keyCommitment) throw new Error('Wrong key');
+        const key = await deriveRoomKey(secret, id);
+        const access = await roomAccessToken(secret);
+        if (generation !== currentGeneration) return;
+        roomKey = key;
+        roomAccess = access;
+      } catch (_) { if (generation === currentGeneration) showRoomIssue('This invite has an invalid encryption key, or this browser cannot use encryption. Open the complete invite on HTTPS with a supported browser.'); return; }
+      document.getElementById('encryption-status').textContent = 'End-to-end encrypted';
       setRoomDeadline(room || knownRoom);
       if (!expired) connectSocket(id);
     } catch (error) {
@@ -164,13 +202,14 @@ import { connectRoom } from "./live-room.js";
       setMessageState("A quiet room. Say hello when you’re ready.");
       return;
     }
-    history.forEach(addMessage);
+    await Promise.all(history.map(addMessage));
+    if (generation !== currentGeneration) return;
     scrollMessagesToEnd();
   }
 
   // Rejoin the shared room and refresh missed history on each native WebSocket connection.
   function connectSocket(id) {
-    socket = connectRoom(id);
+    socket = connectRoom(id, roomAccess);
     socket.on("connect", () => setConnection("connecting", "Joining room"));
     socket.on("chat:ready", (payload) => {
       displayName = payload.displayName;
@@ -188,7 +227,8 @@ import { connectRoom } from "./live-room.js";
       document.getElementById("participant-list").textContent = participants.map(p => p.id === participantId ? `${p.name} (you)` : p.name).join(", ");
     });
     socket.on("chat:message", (message) => addMessage(message));
-    socket.on("room:expired", showExpired);
+    socket.on("room:expired", () => showExpired());
+    socket.on("room:deleted", () => showExpired("deleted"));
     socket.on("chat:error", (payload) => {
       if (payload && payload.message) showToast(payload.message);
     });
@@ -208,6 +248,7 @@ import { connectRoom } from "./live-room.js";
   }
 
   function setComposerEnabled(enabled) {
+    deleteButton.disabled = !enabled || deleting;
     messageInput.disabled = !enabled || sending;
     sendButton.disabled = !enabled || sending;
     attachButton.disabled = !enabled || sending;
@@ -240,6 +281,21 @@ import { connectRoom } from "./live-room.js";
   }
 
   function addMessage(message) {
+    const currentGeneration = generation;
+    const key = roomKey;
+    const id = roomId;
+    receiveQueue = receiveQueue.then(async () => {
+      if (generation !== currentGeneration || !key || !message || seenMessages.has(String(message.id))) return;
+      let payload;
+      try { payload = await decryptMessage(key, id, message); }
+      catch (_) { payload = { text: 'Unable to decrypt this message. It may have been changed or sent with a different key.', attachment: null }; }
+      if (generation !== currentGeneration) return;
+      renderMessage({ ...message, ...payload });
+    }).catch(() => { if (generation === currentGeneration) showToast('Could not display an encrypted message.'); });
+    return receiveQueue;
+  }
+
+  function renderMessage(message) {
     if (!message || message.id == null || seenMessages.has(String(message.id))) return;
     seenMessages.add(String(message.id));
     hideMessageState();
@@ -270,52 +326,62 @@ import { connectRoom } from "./live-room.js";
     scrollMessagesToEnd();
   }
 
-  // Attachments are links to the server's room-scoped URL; preview only opted-in media.
+  // Download ciphertext, authenticate/decrypt locally, then offer a browser-local file.
   function makeAttachment(attachment) {
-    const link = document.createElement("a");
-    link.className = "message-attachment";
-    const url = new URL(attachment.url, location.origin);
-    if (url.origin !== location.origin || !url.pathname.startsWith(`/api/rooms/${roomId}/files/`)) return document.createTextNode('Unavailable attachment');
-    link.href = url.href;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    const name = attachment.originalName || "Attached file";
-    const type = (attachment.mimeType || "").toLowerCase();
-    const previewAllowed = attachment.previewable === true;
-    if (previewAllowed && type.startsWith("image/")) {
-      const image = document.createElement("img");
-      image.className = "attachment-preview";
-      image.src = attachment.url;
-      image.alt = name;
-      image.loading = "lazy";
-      link.append(image);
-    } else if (previewAllowed && type.startsWith("video/")) {
-      const video = document.createElement("video");
-      video.className = "attachment-preview";
-      video.src = attachment.url;
-      video.controls = true;
-      video.preload = "metadata";
-      video.setAttribute("aria-label", name);
-      link.addEventListener("click", (event) => event.preventDefault());
-      link.append(video);
-    } else {
-      const card = document.createElement("span");
-      card.className = "file-card";
-      const symbol = document.createElement("span");
-      symbol.className = "file-symbol";
-      symbol.setAttribute("aria-hidden", "true");
-      symbol.textContent = "↗";
-      const label = document.createElement("span");
-      label.className = "file-label";
-      const title = document.createElement("strong");
-      title.textContent = name;
-      const size = document.createElement("small");
-      size.textContent = formatSize(attachment.size);
-      label.append(title, size);
-      card.append(symbol, label);
-      link.append(card);
-    }
-    return link;
+    const container = document.createElement('div');
+    container.className = 'message-attachment';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'file-card encrypted-file-button';
+    const label = document.createElement('span');
+    label.className = 'file-label';
+    const title = document.createElement('strong');
+    title.textContent = attachment.originalName;
+    const detail = document.createElement('small');
+    detail.textContent = `${formatSize(attachment.size)} / Decrypt & open`;
+    label.append(title, detail);
+    button.append(label);
+    container.append(button);
+    const currentGeneration = generation;
+    const id = roomId;
+    const access = roomAccess;
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      detail.textContent = 'Decrypting...';
+      try {
+        const response = await fetch(`/api/rooms/${id}/files/${attachment.id}`, { cache: 'no-store', headers: { 'X-Room-Access': access }, signal: AbortSignal.timeout(120000) });
+        if (!response.ok) throw new Error('This encrypted file is no longer available.');
+        const length = Number(response.headers.get('Content-Length'));
+        if (!Number.isFinite(length) || length !== attachment.size + 16) throw new Error('Encrypted file size does not match.');
+        const blob = await decryptAttachment(await response.arrayBuffer(), attachment, id);
+        if (generation !== currentGeneration) return;
+        const url = URL.createObjectURL(blob);
+        decryptedUrls.add(url);
+        const download = document.createElement('a');
+        download.href = url;
+        download.download = attachment.originalName;
+        download.className = 'decrypted-download';
+        download.textContent = `Save ${attachment.originalName}`;
+        if (attachment.mimeType.startsWith('image/')) {
+          const preview = document.createElement('img');
+          preview.src = url; preview.alt = attachment.originalName; preview.className = 'attachment-preview';
+          container.append(preview);
+        } else if (attachment.mimeType.startsWith('video/')) {
+          const preview = document.createElement('video');
+          preview.src = url; preview.controls = true; preview.preload = 'metadata'; preview.className = 'attachment-preview';
+          preview.setAttribute('aria-label', attachment.originalName);
+          container.append(preview);
+        }
+        button.remove();
+        container.append(download);
+      } catch (error) {
+        if (generation !== currentGeneration) return;
+        detail.textContent = 'Could not decrypt / Tap to retry';
+        button.disabled = false;
+        showToast(error.message || 'Could not decrypt the attachment.');
+      }
+    });
+    return container;
   }
 
   function scrollMessagesToEnd() {
@@ -323,7 +389,20 @@ import { connectRoom } from "./live-room.js";
   }
 
   function cleanupRoom() {
+    if (deleteDialog.open) deleteDialog.close();
+    document.getElementById("encryption-dialog").close();
+    deleting = false;
+    confirmDelete.disabled = false;
+    confirmDelete.textContent = 'Delete for everyone';
+    cancelDelete.disabled = false;
     generation++;
+    roomKey = null;
+    roomAccess = null;
+    receiveQueue = Promise.resolve();
+    for (const url of decryptedUrls) URL.revokeObjectURL(url);
+    decryptedUrls.clear();
+    messages.replaceChildren();
+    document.getElementById('encryption-status').textContent = 'Checking encryption...';
     sending = false;
     retryMessage = null;
     document.getElementById("participant-count").textContent = 'Connecting';
@@ -348,10 +427,27 @@ import { connectRoom } from "./live-room.js";
     attachmentPending.classList.add("is-hidden");
   }
 
-  function showExpired() {
+  function showRoomIssue(detail) {
+    expired = true;
+    cleanupRoom();
+    expiredView.querySelector('.eyebrow').textContent = 'Encrypted invite required';
+    expiredView.querySelector('h1').textContent = 'Keep the key with the link.';
+    expiredView.querySelector('.intro').textContent = detail;
+    showState('expired');
+  }
+
+  function showExpired(reason = "expired") {
     if (expired) return;
     expired = true;
     cleanupRoom();
+    // Remove already-rendered copies as soon as the room is closed.
+    messages.replaceChildren();
+    seenMessages.clear();
+    expiredView.querySelector('h1').innerHTML = 'A good moment.<br>Now, a new one.';
+    expiredView.querySelector('.eyebrow').textContent = reason === 'deleted' ? 'This chat was deleted' : 'This room has closed';
+    expiredView.querySelector('.intro').textContent = reason === 'deleted'
+      ? 'This room was deleted for everyone. Its conversation is no longer available, and the invite link no longer works.'
+      : 'This temporary room has expired, so its conversation is no longer available.';
     setConnection("disconnected", "Room closed");
     showState("expired");
   }
@@ -391,18 +487,19 @@ import { connectRoom } from "./live-room.js";
     attachmentPending.classList.remove("is-hidden");
   }
 
-  function uploadFile(file) {
+  function uploadFile(encrypted, originalName) {
     const uploadGeneration = generation;
     return new Promise((resolve, reject) => {
       const request = new XMLHttpRequest();
       request.timeout = 120000;
       activeUpload = request;
-      uploadFilename.textContent = file.name;
+      uploadFilename.textContent = originalName;
       uploadPercent.textContent = "0%";
       uploadProgress.style.width = "0%";
       uploadStatus.classList.remove("is-hidden");
       attachmentPending.classList.add("is-hidden");
       request.open("POST", `/api/rooms/${encodeURIComponent(roomId)}/uploads`);
+      request.setRequestHeader("X-Room-Access", roomAccess);
       request.upload.addEventListener("progress", (event) => {
         if (generation !== uploadGeneration || !event.lengthComputable) return;
         const progress = Math.round((event.loaded / event.total) * 100);
@@ -443,7 +540,8 @@ import { connectRoom } from "./live-room.js";
         reject(new Error("Upload cancelled."));
       });
       const data = new FormData();
-      data.append("file", file);
+      data.append("id", encrypted.attachment.id);
+      data.append("file", encrypted.blob, "encrypted.bin");
       request.send(data);
     });
   }
@@ -451,7 +549,7 @@ import { connectRoom } from "./live-room.js";
   async function sendMessage(event) {
     event.preventDefault();
     if (sending) return;
-    if (!socket || !socket.connected || !displayName || expired) {
+    if (!socket || !socket.connected || !displayName || !roomKey || expired) {
       showToast("Reconnecting. Your message hasn’t been sent.");
       return;
     }
@@ -459,6 +557,9 @@ import { connectRoom } from "./live-room.js";
     if (!text && !selectedFile) return;
     const currentGeneration = generation;
     const sendingSocket = socket;
+    const encryptionKey = roomKey;
+    const sendingRoom = roomId;
+    const sendingIdentity = { roomId, senderId: participantId, sender: displayName };
     const file = selectedFile;
     const draft = retryMessage && retryMessage.text === text && retryMessage.file === file ? retryMessage : { text, file, clientId: crypto.randomUUID(), attachment: null };
     retryMessage = draft;
@@ -469,11 +570,18 @@ import { connectRoom } from "./live-room.js";
     attachButton.disabled = true;
     let attachment = draft.attachment;
     try {
-      if (file && !attachment) attachment = draft.attachment = await uploadFile(file);
+      if (file && !attachment) {
+        const encrypted = await encryptAttachment(file, sendingRoom);
+        if (generation !== currentGeneration) return;
+        await uploadFile(encrypted, file.name);
+        attachment = draft.attachment = encrypted.attachment;
+      }
       if (generation !== currentGeneration) return;
       if (!socket || !socket.connected || expired) throw new Error("Connection lost. Rejoin and try sending again.");
+      const envelope = await encryptMessage(encryptionKey, { ...sendingIdentity, clientId: draft.clientId }, { text, attachment });
+      if (generation !== currentGeneration) return;
       await new Promise((resolve, reject) => {
-        sendingSocket.timeout(8000).emit("chat:send", { text, attachment, clientId: draft.clientId }, (error, result) => {
+        sendingSocket.timeout(8000).emit("chat:send", { envelope, attachmentId: attachment?.id || null, clientId: draft.clientId }, (error, result) => {
           if (error) {
             reject(new Error("The server did not confirm your message. Please try again."));
           } else if (!result || result.ok !== true) {
@@ -502,6 +610,43 @@ import { connectRoom } from "./live-room.js";
       }
     }
   }
+
+  const encryptionDialog = document.getElementById('encryption-dialog');
+  document.getElementById('encryption-info').addEventListener('click', () => encryptionDialog.showModal());
+  document.getElementById('close-encryption-info').addEventListener('click', () => encryptionDialog.close());
+
+  deleteButton.addEventListener('click', () => {
+    deleteError.textContent = '';
+    deleteDialog.showModal();
+    cancelDelete.focus();
+  });
+  cancelDelete.addEventListener('click', () => deleteDialog.close());
+  deleteDialog.addEventListener('cancel', event => { if (deleting) event.preventDefault(); });
+  deleteDialog.addEventListener('click', event => { if (event.target === deleteDialog && !deleting) deleteDialog.close(); });
+  confirmDelete.addEventListener('click', async () => {
+    if (deleting || !socket || expired) return;
+    const currentGeneration = generation;
+    const currentSocket = socket;
+    deleting = true;
+    confirmDelete.disabled = cancelDelete.disabled = deleteButton.disabled = true;
+    confirmDelete.textContent = 'Deleting...';
+    deleteError.textContent = '';
+    try {
+      const result = await currentSocket.deleteRoom();
+      if (generation === currentGeneration) showExpired('deleted');
+      if (result.cleanupPending) showToast('Room closed. File cleanup will retry automatically.');
+    } catch (error) {
+      if (generation !== currentGeneration) return;
+      deleteError.textContent = error.message || 'Could not delete the chat. Please try again.';
+    } finally {
+      if (generation === currentGeneration) {
+        deleting = false;
+        confirmDelete.disabled = cancelDelete.disabled = false;
+        confirmDelete.textContent = 'Delete for everyone';
+        deleteButton.disabled = !socket?.connected;
+      }
+    }
+  });
 
   createButton.addEventListener("click", createRoom);
   newRoomButton.addEventListener("click", () => {
@@ -540,7 +685,7 @@ import { connectRoom } from "./live-room.js";
   cancelUploadButton.addEventListener("click", () => {
     if (activeUpload) activeUpload.abort();
   });
-  window.addEventListener("popstate", () => {
+  function routeFromUrl() {
     const requestedRoom = new URLSearchParams(window.location.search).get("room");
     if (/^[a-z\d_-]{32}$/i.test(requestedRoom || "")) openRoom(requestedRoom);
     else {
@@ -549,7 +694,9 @@ import { connectRoom } from "./live-room.js";
       expired = false;
       showState("home");
     }
-  });
+  }
+  window.addEventListener("popstate", routeFromUrl);
+  window.addEventListener("hashchange", routeFromUrl);
 
   // A malformed or absent room link lands on the simple create-room home state.
   const initialRoomId = new URLSearchParams(window.location.search).get("room");

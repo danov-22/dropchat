@@ -1,5 +1,5 @@
 // Small native WebSocket transport for the Cloudflare room protocol.
-export function connectRoom(roomId) {
+export function connectRoom(roomId, accessToken) {
   const listeners = new Map();
   const pending = new Map();
   let stopped = false, retryTimer, retry = 0, ws;
@@ -13,6 +13,14 @@ export function connectRoom(roomId) {
   const notify = (event, data) => { for (const fn of listeners.get(event) || []) fn(data); };
   const transport = {
     connected: false,
+    async deleteRoom() {
+      const response = await fetch(`/api/rooms/${roomId}`, {
+        method: 'DELETE', headers: { 'X-Room-Session': token }, signal: AbortSignal.timeout(15000)
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Could not delete the chat. Please try again.');
+      return result;
+    },
     on(event, callback) { if (!listeners.has(event)) listeners.set(event, []); listeners.get(event).push(callback); },
     removeAllListeners() { listeners.clear(); },
     disconnect() { stopped = true; clearTimeout(retryTimer); transport.connected = false; ws?.close(); rejectPending(); },
@@ -38,7 +46,7 @@ export function connectRoom(roomId) {
     const joinTimeout = setTimeout(() => ws.close(), 10000);
     ws.onopen = () => {
       notify('connect');
-      ws.send(JSON.stringify({ event: 'room:join', data: { token } }));
+      ws.send(JSON.stringify({ event: 'room:join', data: { token, accessToken } }));
     };
     ws.onmessage = ({ data }) => {
       let packet;
@@ -55,7 +63,7 @@ export function connectRoom(roomId) {
       transport.connected = false;
       rejectPending();
       if (stopped) return;
-      if (code === 4004) { stopped = true; notify('room:expired'); return; }
+      if (code === 4004) { stopped = true; notify(reason === 'Room deleted' ? 'room:deleted' : 'room:expired'); return; }
       if (code === 4003) { stopped = true; notify('disconnect'); notify('chat:error', { message: reason }); return; }
       notify('disconnect');
       try {

@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Miniflare, convertV4MiniflareOptions, FormData } from 'miniflare';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, encryptMessage, decryptMessage, encryptAttachment, decryptAttachment, fromBase64, toBase64 } from '../encryption.js';
 
 const origin = 'https://dropchat.test';
 function runtime(bindings = {}) {
-  return new Miniflare(convertV4MiniflareOptions({ name: 'dropchat', modules: true, scriptPath: 'worker.js', compatibilityDate: '2026-04-01', durableObjects: { ROOMS: { className: 'ChatRoom', useSQLite: true } }, r2Buckets: ['FILES'], bindings }));
+  return new Miniflare(convertV4MiniflareOptions({ name: 'dropchat', modules: [{ type: 'ESModule', path: 'worker.js' }, { type: 'ESModule', path: 'protocol.js' }], compatibilityDate: '2026-04-01', durableObjects: { ROOMS: { className: 'ChatRoom', useSQLite: true } }, r2Buckets: ['FILES'], bindings }));
 }
 function inbox(ws) {
   const packets = [], waiters = [];
@@ -19,119 +20,159 @@ function inbox(ws) {
   return (event, predicate = () => true) => {
     const index = packets.findIndex(p => p.event === event && predicate(p.data));
     if (index >= 0) return Promise.resolve(packets.splice(index, 1)[0].data);
-    return new Promise((resolve, reject) => {
-      const entry = { event, predicate, resolve, timer: setTimeout(() => reject(new Error(`Timed out waiting for ${event}`)), 5000) };
-      waiters.push(entry);
-    });
+    return new Promise((resolve, reject) => { waiters.push({ event, predicate, resolve, timer: setTimeout(() => reject(new Error(`Timed out waiting for ${event}`)), 5000) }); });
   };
 }
-async function create(mf) { const response = await mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST' }); assert.equal(response.status, 201); return response.json(); }
-async function join(mf, roomId, token = randomBytes(32).toString('hex')) {
-  const response = await mf.dispatchFetch(`${origin}/api/rooms/${roomId}/socket`, { headers: { Upgrade: 'websocket', Origin: origin } });
+async function create(mf) {
+  const secret = generateRoomSecret(), access = await roomAccessToken(secret);
+  const response = await mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ encryptionVersion: 1, keyCommitment: await roomCommitment(secret) }) });
+  assert.equal(response.status, 201);
+  const room = await response.json();
+  return { ...room, secret, access, key: await deriveRoomKey(secret, room.roomId) };
+}
+function request(mf, room, suffix = '', init = {}) {
+  return mf.dispatchFetch(`${origin}/api/rooms/${room.roomId}${suffix}`, { ...init, headers: { 'X-Room-Access': room.access, ...init.headers } });
+}
+async function join(mf, room, token = randomBytes(32).toString('hex'), accessToken = room.access) {
+  const response = await request(mf, room, '/socket', { headers: { Upgrade: 'websocket', Origin: origin } });
   assert.equal(response.status, 101);
   const ws = response.webSocket, next = inbox(ws);
-  ws.send(JSON.stringify({ event: 'room:join', data: { token } }));
-  return { ws, next, token, identity: await next('chat:ready') };
+  ws.send(JSON.stringify({ event: 'room:join', data: { token, accessToken } }));
+  return { ws, next, token, room, identity: await next('chat:ready') };
 }
-async function send(client, text, options = {}) {
+async function emit(client, data) {
   const requestId = randomUUID();
-  client.ws.send(JSON.stringify({ event: 'chat:send', requestId, data: { text, clientId: randomUUID(), ...options } }));
+  client.ws.send(JSON.stringify({ event: 'chat:send', requestId, data }));
   return client.next('chat:ack', p => p.requestId === requestId);
 }
+async function wire(client, text, attachment = null, clientId = randomUUID()) {
+  const context = { roomId: client.room.roomId, clientId, senderId: client.identity.participantId, sender: client.identity.displayName };
+  const envelope = await encryptMessage(client.room.key, context, { text, attachment });
+  return { envelope, clientId, attachmentId: attachment?.id || null };
+}
+async function upload(mf, room, content = 'private file contents', name = 'private-name.txt') {
+  const encrypted = await encryptAttachment(new File([content], name, { type: 'text/plain' }), room.roomId);
+  const form = new FormData(); form.append('id', encrypted.attachment.id); form.append('file', encrypted.blob, 'encrypted.bin');
+  const response = await request(mf, room, '/uploads', { method: 'POST', body: form });
+  assert.equal(response.status, 201);
+  return encrypted;
+}
 
-test('shared links support group chat, isolation, reconnect, uploads and validation', async () => {
+test('AES-GCM round trips, fresh IVs and binding reject wrong keys and tampering', async () => {
+  const secret = generateRoomSecret(), roomId = randomUUID().replaceAll('-', '');
+  assert.equal(fromBase64(secret, 32).length, 32);
+  const key = await deriveRoomKey(secret, roomId);
+  assert.equal(key.extractable, false);
+  const context = { roomId, clientId: randomUUID(), senderId: randomUUID(), sender: 'Guest 1' };
+  const payload = { text: 'Private conversation with unicode: \u2728\u4f60\u597d', attachment: null };
+  const envelope = await encryptMessage(key, context, payload);
+  const message = { ...context, envelope, attachmentId: null };
+  assert.deepEqual(await decryptMessage(key, roomId, message), payload);
+  assert.notEqual((await encryptMessage(key, context, payload)).iv, envelope.iv);
+  await assert.rejects(decryptMessage(await deriveRoomKey(generateRoomSecret(), roomId), roomId, message));
+  await assert.rejects(decryptMessage(key, randomUUID().replaceAll('-', ''), message));
+  await assert.rejects(decryptMessage(key, roomId, { ...message, sender: 'Guest 2' }));
+  await assert.rejects(decryptMessage(key, roomId, { ...message, clientId: randomUUID() }));
+  const changed = fromBase64(envelope.ciphertext); changed[0] ^= 1;
+  await assert.rejects(decryptMessage(key, roomId, { ...message, envelope: { ...envelope, ciphertext: toBase64(changed) } }));
+  await assert.rejects(encryptMessage(key, context, { text: 'x'.repeat(4001) }));
+  const file = await encryptAttachment(new File(['secret file'], 'secret.txt', { type: 'text/plain' }), roomId);
+  const bytes = await file.blob.arrayBuffer();
+  assert.equal(await (await decryptAttachment(bytes, file.attachment, roomId)).text(), 'secret file');
+  await assert.rejects(decryptAttachment(bytes, file.attachment, randomUUID().replaceAll('-', '')));
+  const corrupt = new Uint8Array(bytes); corrupt[0] ^= 1;
+  await assert.rejects(decryptAttachment(corrupt, file.attachment, roomId));
+});
+
+test('encrypted group chat preserves history, isolation, identity, presence and deduplication', async () => {
   const mf = runtime();
   try {
     const room = await create(mf), other = await create(mf);
-    assert.match(room.roomId, /^[a-f0-9]{32}$/);
-    const a = await join(mf, room.roomId), b = await join(mf, room.roomId), c = await join(mf, room.roomId), outsider = await join(mf, other.roomId);
+    const a = await join(mf, room), b = await join(mf, room), c = await join(mf, room), outsider = await join(mf, other);
     assert.equal(new Set([a.identity.participantId, b.identity.participantId, c.identity.participantId]).size, 3);
-    assert.equal((await a.next('room:presence', p => p.participants.length === 3)).participants.length, 3);
-    const clientId = randomUUID();
-    assert.equal((await send(a, 'Hello group!', { clientId })).ok, true);
+    await a.next('room:presence', p => p.participants.length === 3);
+    const packet = await wire(a, 'Never send this plaintext to the server');
+    assert.equal((await emit(a, packet)).ok, true);
     const first = await a.next('chat:message');
     assert.equal((await b.next('chat:message')).id, first.id);
     assert.equal((await c.next('chat:message')).id, first.id);
-    assert.equal(first.senderId, a.identity.participantId);
-    assert.equal((await send(a, 'Hello group!', { clientId })).ok, true);
-    let history = await (await mf.dispatchFetch(`${origin}/api/rooms/${room.roomId}/messages`)).json();
-    assert.equal(history.messages.length, 1, 'acknowledgement retry must not duplicate messages');
-    const isolated = await (await mf.dispatchFetch(`${origin}/api/rooms/${other.roomId}/messages`)).json();
-    assert.equal(isolated.messages.length, 0);
-    const rejoined = await join(mf, room.roomId, a.token);
+    assert.equal((await decryptMessage(room.key, room.roomId, first)).text, 'Never send this plaintext to the server');
+    assert.ok(!JSON.stringify(first).includes('Never send this plaintext'));
+    assert.equal(first.text, undefined); assert.equal(first.attachment, undefined);
+    assert.equal((await emit(a, packet)).ok, true);
+    const history = await (await request(mf, room, '/messages')).json();
+    assert.equal(history.messages.length, 1);
+    assert.deepEqual(history.messages[0].envelope, packet.envelope);
+    assert.equal((await (await request(mf, other, '/messages')).json()).messages.length, 0);
+    await assert.rejects(decryptMessage(other.key, other.roomId, first));
+    const rejoined = await join(mf, room, a.token);
     assert.equal(rejoined.identity.participantId, a.identity.participantId);
-    assert.equal(rejoined.identity.displayName, a.identity.displayName);
     b.ws.close(1000, 'Leaving');
     await c.next('room:presence', p => p.participants.length === 2);
-    assert.equal((await send(c, 'Group reply')).ok, true);
-    assert.equal((await rejoined.next('chat:message', p => p.text === 'Group reply')).senderId, c.identity.participantId);
-    assert.equal((await send(outsider, 'x'.repeat(4001))).ok, false);
-    assert.equal((await send(outsider, 'Forged file', { attachment: { id: randomUUID(), url: 'javascript:alert(1)' } })).ok, false);
-    const form = new FormData(); form.append('file', new File(['group file'], 'hello.txt', { type: 'text/plain' }));
-    const uploaded = await mf.dispatchFetch(`${origin}/api/rooms/${room.roomId}/uploads`, { method: 'POST', body: form });
-    assert.equal(uploaded.status, 201, uploaded.status === 201 ? '' : await uploaded.text());
-    const attachment = await uploaded.json();
-    assert.equal(await (await mf.dispatchFetch(`${origin}${attachment.url}`)).text(), 'group file');
-    assert.equal((await mf.dispatchFetch(`${origin}/api/rooms/${other.roomId}/files/${attachment.id}`)).status, 404);
-    assert.equal((await send(outsider, 'Cross-room file', { attachment })).ok, false);
-    assert.equal((await mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { Origin: 'https://evil.test' } })).status, 403);
-    const invalid = await mf.dispatchFetch(`${origin}/api/rooms/invalid`); assert.equal(invalid.status, 404);
+    assert.equal((await emit(c, await wire(c, 'Encrypted reply'))).ok, true);
+    assert.equal((await decryptMessage(room.key, room.roomId, await rejoined.next('chat:message', p => p.senderId === c.identity.participantId))).text, 'Encrypted reply');
+    assert.equal((await emit(outsider, { text: 'Plaintext rejected', clientId: randomUUID() })).ok, false);
+    const invalidFile = await wire(outsider, 'Forged file'); invalidFile.attachmentId = randomUUID();
+    assert.equal((await emit(outsider, invalidFile)).ok, false);
     for (const client of [a, c, outsider, rejoined]) client.ws.close();
   } finally { await mf.dispose(); }
 });
 
-test('expiry closes all guests and removes history and private files', async () => {
-  const mf = runtime({ ROOM_TTL_SECONDS: '2' });
+test('only encrypted files and complete-invite access are accepted; ciphertext has no filename', async () => {
+  const mf = runtime();
   try {
-    const room = await create(mf);
-    const a = await join(mf, room.roomId), b = await join(mf, room.roomId);
-    assert.equal((await send(a, 'Temporary message')).ok, true);
-    const form = new FormData(); form.append('file', new File(['temporary'], 'expiry.txt', { type: 'text/plain' }));
-    const attachment = await (await mf.dispatchFetch(`${origin}/api/rooms/${room.roomId}/uploads`, { method: 'POST', body: form })).json();
-    await Promise.all([a.next('room:expired'), b.next('room:expired')]);
-    assert.equal((await mf.dispatchFetch(`${origin}/api/rooms/${room.roomId}/messages`)).status, 404);
-    assert.equal((await mf.dispatchFetch(`${origin}${attachment.url}`)).status, 404);
+    const room = await create(mf), other = await create(mf);
+    const a = await join(mf, room);
+    const file = await upload(mf, room);
+    const response = await request(mf, room, `/files/${file.attachment.id}`);
+    assert.equal(response.headers.get('Content-Type'), 'application/octet-stream');
+    assert.ok(!response.headers.get('Content-Disposition').includes('private-name'));
+    const bytes = await response.arrayBuffer();
+    assert.ok(!new TextDecoder().decode(bytes).includes('private file contents'));
+    assert.equal(await (await decryptAttachment(bytes, file.attachment, room.roomId)).text(), 'private file contents');
     const bucket = await mf.getR2Bucket('FILES');
-    // Alarm performs deletion after broadcasting expiry; wait briefly for completion.
-    for (let attempt = 0; attempt < 20 && (await bucket.list()).objects.length; attempt++) await new Promise(resolve => setTimeout(resolve, 50));
-    assert.equal((await bucket.list()).objects.length, 0);
+    const object = await bucket.get(`${room.roomId}/${file.attachment.id}`);
+    assert.deepEqual(new Uint8Array(await object.arrayBuffer()), new Uint8Array(bytes));
+    assert.equal((await emit(a, await wire(a, 'Encrypted file attached', file.attachment))).ok, true);
+    const historyText = await (await request(mf, room, '/messages')).text();
+    for (const secret of ['private-name.txt', 'private file contents', file.attachment.key, file.attachment.iv]) assert.ok(!historyText.includes(secret));
+    assert.equal((await request(mf, other, `/files/${file.attachment.id}`)).status, 404);
+    assert.equal((await mf.dispatchFetch(`${origin}/api/rooms/${room.roomId}/messages`)).status, 403);
+    assert.equal((await request(mf, room, '/messages', { headers: { 'X-Room-Access': other.access } })).status, 403);
+    const form = new FormData(); form.append('id', randomUUID()); form.append('file', new File(['plaintext'], 'secret.txt', { type: 'text/plain' }));
+    assert.equal((await request(mf, room, '/uploads', { method: 'POST', body: form })).status, 400);
+    assert.equal((await mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST' })).status, 400);
+    const denied = await request(mf, room, '/socket', { headers: { Upgrade: 'websocket' } });
+    const next = inbox(denied.webSocket);
+    const closed = new Promise(resolve => denied.webSocket.addEventListener('close', resolve));
+    denied.webSocket.send(JSON.stringify({ event: 'room:join', data: { token: randomBytes(32).toString('hex'), accessToken: other.access } }));
+    assert.equal((await closed).code, 4003);
+    a.ws.close();
   } finally { await mf.dispose(); }
 });
 
-test('browser transport sends and acknowledges messages using native WebSockets', async () => {
-  const mf = runtime();
-  const { connectRoom } = await import('../live-room.js');
-  const clients = [];
-  const previousLocation = globalThis.location;
-  const previousStorage = globalThis.sessionStorage;
-  try {
-    const base = await mf.ready;
-    globalThis.location = { href: base.href, protocol: base.protocol, origin: base.origin };
-    const room = await (await fetch(new URL('/api/rooms', base), { method: 'POST' })).json();
-    const listen = (client, event) => new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`Transport timed out: ${event}`)), 5000);
-      client.on(event, value => { clearTimeout(timer); resolve(value); });
-    });
-    const open = async () => {
-      // Simulate separate browser tab storage.
-      const stored = new Map();
-      globalThis.sessionStorage = { getItem: key => stored.get(key), setItem: (key, value) => stored.set(key, value) };
-      const client = connectRoom(room.roomId);
-      clients.push(client);
-      const identity = await listen(client, 'chat:ready');
-      return { client, identity };
-    };
-    const a = await open(), b = await open();
-    assert.notEqual(a.identity.participantId, b.identity.participantId);
-    assert.equal(a.client.connected, true);
-    const delivered = listen(b.client, 'chat:message');
-    const result = await new Promise((resolve, reject) => a.client.timeout(5000).emit('chat:send', { text: 'Native group transport', clientId: randomUUID() }, (error, ack) => error ? reject(error) : resolve(ack)));
-    assert.equal(result.ok, true);
-    assert.equal((await delivered).text, 'Native group transport');
-  } finally {
-    clients.forEach(client => client.disconnect());
-    globalThis.location = previousLocation;
-    globalThis.sessionStorage = previousStorage;
-    await mf.dispose();
+test('expiry and confirmed deletion remove encrypted history/files and revoke every guest', async () => {
+  for (const manual of [false, true]) {
+    const mf = runtime(manual ? {} : { ROOM_TTL_SECONDS: '2' });
+    try {
+      const room = await create(mf), other = await create(mf);
+      const a = await join(mf, room), b = await join(mf, room), outsider = await join(mf, other);
+      await emit(a, await wire(a, 'Temporary encrypted message'));
+      const file = await upload(mf, room);
+      if (manual) {
+        assert.equal((await request(mf, room, '', { method: 'DELETE' })).status, 403);
+        assert.equal((await request(mf, room, '', { method: 'DELETE', headers: { 'X-Room-Session': outsider.token } })).status, 403);
+        assert.equal((await request(mf, room, '', { method: 'DELETE', headers: { Origin: 'https://evil.test', 'X-Room-Session': b.token } })).status, 403);
+        const response = await request(mf, room, '', { method: 'DELETE', headers: { 'X-Room-Session': b.token } });
+        assert.equal(response.status, 200); assert.deepEqual(await response.json(), { deleted: true });
+      }
+      await Promise.all([a.next(manual ? 'room:deleted' : 'room:expired'), b.next(manual ? 'room:deleted' : 'room:expired')]);
+      for (const suffix of ['', '/messages', `/files/${file.attachment.id}`]) assert.equal((await request(mf, room, suffix)).status, 404);
+      const bucket = await mf.getR2Bucket('FILES');
+      for (let i = 0; i < 20 && (await bucket.list({ prefix: `${room.roomId}/` })).objects.length; i++) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.equal((await bucket.list({ prefix: `${room.roomId}/` })).objects.length, 0);
+      if (manual) assert.equal((await request(mf, other)).status, 200);
+      outsider.ws.close();
+    } finally { await mf.dispose(); }
   }
 });

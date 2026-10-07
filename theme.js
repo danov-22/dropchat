@@ -7,8 +7,7 @@
   function apply(theme) {
     root.dataset.theme = theme;
     document.querySelector('meta[name="theme-color"]').content = theme === 'dark' ? '#171717' : '#f8f7f3';
-    const button = document.getElementById('theme-toggle');
-    if (button) {
+    for (const button of document.querySelectorAll('#theme-toggle, #room-theme-toggle')) {
       button.textContent = theme === 'dark' ? 'Light mode' : 'Dark mode';
       button.setAttribute('aria-label', theme === 'dark' ? 'Use light mode' : 'Use dark mode');
       button.setAttribute('aria-pressed', String(theme === 'dark'));
@@ -25,7 +24,7 @@
   });
   document.addEventListener('DOMContentLoaded', () => {
     apply(root.dataset.theme);
-    document.getElementById('theme-toggle').addEventListener('click', () => {
+    for (const button of document.querySelectorAll('#theme-toggle, #room-theme-toggle')) button.addEventListener('click', () => {
       saved = root.dataset.theme === 'dark' ? 'light' : 'dark';
       try { localStorage.setItem('dropchat-theme', saved); } catch (_) {}
       apply(saved);
