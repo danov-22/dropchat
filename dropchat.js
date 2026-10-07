@@ -42,6 +42,8 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
 
   const MAX_FILE_SIZE = 25 * 1024 * 1024;
   let roomId = null;
+  let encryptionContext = null;
+  let reusableRoom = false;
   let roomKey = null;
   let roomAccess = null;
   let receiveQueue = Promise.resolve();
@@ -125,13 +127,20 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
 
   // Create first, then place the server-issued room ID in the shareable URL.
   async function createRoom() {
+    const customName = document.getElementById('custom-name').value.trim().toLowerCase();
+    const reusable = document.getElementById('reusable-link').checked;
+    if (customName && (!/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(customName) || /^[a-f0-9]{32}$/.test(customName))) {
+      homeStatus.textContent = 'Use 3-40 letters, numbers or hyphens; start and end with a letter or number. Choose a name rather than a room ID.';
+      document.getElementById('custom-name').focus();
+      return;
+    }
     createButton.disabled = true;
     createButton.querySelector("span:first-child").textContent = "Making your room…";
     homeStatus.textContent = "A moment while we set things up.";
     try {
       const secret = generateRoomSecret();
       const keyCommitment = await roomCommitment(secret);
-      const room = await apiRequest("/api/rooms", { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ encryptionVersion: 1, keyCommitment }) });
+      const room = await apiRequest("/api/rooms", { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ encryptionVersion: 1, keyCommitment, reusable, ...(customName ? { customName } : {}) }) });
       if (!room.roomId) throw new Error("The server did not return a room link.");
       history.pushState({}, "", `/?room=${encodeURIComponent(room.roomId)}#key=${secret}`);
       await openRoom(room.roomId, room);
@@ -146,6 +155,8 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
 
   async function openRoom(id, knownRoom = null) {
     cleanupRoom();
+    reusableRoom = false;
+    document.getElementById('reuse-room').classList.add('is-hidden');
     const currentGeneration = generation;
     roomId = id;
     expired = false;
@@ -166,11 +177,17 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
       const room = await apiRequest(`/api/rooms/${encodeURIComponent(id)}`);
       if (generation !== currentGeneration) return;
       if (room.encryptionVersion !== 1) { showRoomIssue('This room predates encryption. Create a new room to start an encrypted conversation.'); return; }
+      reusableRoom = room.reusable === true;
+      encryptionContext = room.encryptionContext || id;
+      document.querySelector('.expiry-chip').title = reusableRoom ? 'This chat clears when the timer ends. Reopen the same invite to start a fresh chat.' : 'This room automatically closes when the timer ends';
+      document.getElementById('room-lifetime').textContent = reusableRoom ? 'Chat clears after 24 hours. This invite can be reused.' : 'Auto-deletes after 24 hours.';
+      document.querySelector('.room-subtitle').textContent = reusableRoom ? 'One invite. Fresh chats every 24 hours.' : 'A temporary room for your people.';
+      roomCode.textContent = /^[a-f0-9]{32}$/.test(id) ? `${id.slice(0, 6)}...${id.slice(-4)}` : id;
       const secret = new URLSearchParams(location.hash.slice(1)).get('key');
       if (!secret) { showRoomIssue('This invite is missing its encryption key. Ask someone in the room to share the complete invite link, including the part after #.'); return; }
       try {
         if (await roomCommitment(secret) !== room.keyCommitment) throw new Error('Wrong key');
-        const key = await deriveRoomKey(secret, id);
+        const key = await deriveRoomKey(secret, encryptionContext);
         const access = await roomAccessToken(secret);
         if (generation !== currentGeneration) return;
         roomKey = key;
@@ -283,7 +300,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   function addMessage(message) {
     const currentGeneration = generation;
     const key = roomKey;
-    const id = roomId;
+    const id = encryptionContext;
     receiveQueue = receiveQueue.then(async () => {
       if (generation !== currentGeneration || !key || !message || seenMessages.has(String(message.id))) return;
       let payload;
@@ -345,6 +362,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     const currentGeneration = generation;
     const id = roomId;
     const access = roomAccess;
+    const context = encryptionContext;
     button.addEventListener('click', async () => {
       button.disabled = true;
       detail.textContent = 'Decrypting...';
@@ -353,7 +371,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
         if (!response.ok) throw new Error('This encrypted file is no longer available.');
         const length = Number(response.headers.get('Content-Length'));
         if (!Number.isFinite(length) || length !== attachment.size + 16) throw new Error('Encrypted file size does not match.');
-        const blob = await decryptAttachment(await response.arrayBuffer(), attachment, id);
+        const blob = await decryptAttachment(await response.arrayBuffer(), attachment, context);
         if (generation !== currentGeneration) return;
         const url = URL.createObjectURL(blob);
         decryptedUrls.add(url);
@@ -428,6 +446,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   }
 
   function showRoomIssue(detail) {
+    document.getElementById('reuse-room').classList.add('is-hidden');
     expired = true;
     cleanupRoom();
     expiredView.querySelector('.eyebrow').textContent = 'Encrypted invite required';
@@ -448,6 +467,9 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     expiredView.querySelector('.intro').textContent = reason === 'deleted'
       ? 'This room was deleted for everyone. Its conversation is no longer available, and the invite link no longer works.'
       : 'This temporary room has expired, so its conversation is no longer available.';
+    const canReuse = reusableRoom && reason !== 'deleted';
+    document.getElementById('reuse-room').classList.toggle('is-hidden', !canReuse);
+    if (canReuse) expiredView.querySelector('.intro').textContent = 'This chat has expired and its history is gone. Your invite still works: start a fresh 24-hour chat with the same link.';
     setConnection("disconnected", "Room closed");
     showState("expired");
   }
@@ -558,8 +580,8 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     const currentGeneration = generation;
     const sendingSocket = socket;
     const encryptionKey = roomKey;
-    const sendingRoom = roomId;
-    const sendingIdentity = { roomId, senderId: participantId, sender: displayName };
+    const sendingRoom = encryptionContext;
+    const sendingIdentity = { roomId: encryptionContext, senderId: participantId, sender: displayName };
     const file = selectedFile;
     const draft = retryMessage && retryMessage.text === text && retryMessage.file === file ? retryMessage : { text, file, clientId: crypto.randomUUID(), attachment: null };
     retryMessage = draft;
@@ -648,6 +670,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     }
   });
 
+  document.getElementById('reuse-room').addEventListener('click', () => openRoom(roomId));
   createButton.addEventListener("click", createRoom);
   newRoomButton.addEventListener("click", () => {
     history.pushState({}, "", "/");
@@ -687,7 +710,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   });
   function routeFromUrl() {
     const requestedRoom = new URLSearchParams(window.location.search).get("room");
-    if (/^[a-z\d_-]{32}$/i.test(requestedRoom || "")) openRoom(requestedRoom);
+    if (/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(requestedRoom || "")) openRoom(requestedRoom);
     else {
       cleanupRoom();
       roomId = null;
@@ -700,6 +723,6 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
 
   // A malformed or absent room link lands on the simple create-room home state.
   const initialRoomId = new URLSearchParams(window.location.search).get("room");
-  if (/^[a-z\d_-]{32}$/i.test(initialRoomId || "")) openRoom(initialRoomId);
+  if (/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(initialRoomId || "")) openRoom(initialRoomId);
   else showState("home");
 })();

@@ -294,3 +294,15 @@ body.is-chat-room .room-footer { display: none; }
 .encrypted-file-button { width: 100%; border: 1px solid currentColor; color: inherit; font: inherit; text-align: left; cursor: pointer; }
 .encrypted-file-button:disabled { opacity: .6; cursor: wait; }
 .decrypted-download { display: inline-block; margin-top: 10px; color: inherit; font-size: 14px; overflow-wrap: anywhere; }
+
+.invite-options { width: min(100%, 370px); margin: 0 auto 22px; text-align: left; }
+.invite-options > label { display: block; font-size: 15px; margin-bottom: 8px; }
+.invite-options label span { color: var(--muted); }
+#custom-name { width: 100%; padding: 12px 15px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--ink); font: 16px var(--sans); }
+.invite-options .reusable-option { display: flex; align-items: center; gap: 10px; margin-top: 14px; line-height: 1.4; }
+#reusable-link { width: 18px; height: 18px; accent-color: var(--ink); flex-shrink: 0; }
+#invite-help { font-size: 14px; color: var(--muted); line-height: 1.5; margin: 10px 0 0; }
+#reuse-room { margin: 14px; }
+.room-code code { overflow-wrap: anywhere; }
+
+@media (max-width: 760px) { .home-view { padding-bottom: 350px; } }

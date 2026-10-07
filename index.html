@@ -27,6 +27,12 @@
           <p class="eyebrow"><span class="eyebrow-dot"></span> A space for your people</p>
           <h1>Good company.<br>One link.</h1>
           <p class="intro">An encrypted group chat for the conversations that happen in the moment. No accounts. Just your people.</p>
+          <div class="invite-options">
+            <label for="custom-name">Custom link name <span>(optional)</span></label>
+            <input id="custom-name" type="text" maxlength="40" pattern="[a-z0-9][a-z0-9-]{1,38}[a-z0-9]" placeholder="weekend-crew" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="invite-help">
+            <label class="reusable-option"><input id="reusable-link" type="checkbox"> Reuse this link for future chats</label>
+            <p id="invite-help">3-40 letters, numbers or hyphens. Reusable links start a fresh, empty 24-hour chat when reopened after expiry. Keep the complete encrypted invite.</p>
+          </div>
           <button class="button button-primary create-button" id="create-room" type="button">
             <span>Create a room</span><span class="button-arrow" aria-hidden="true">↗</span>
           </button>
@@ -40,7 +46,7 @@
           <div class="orbit-card card-time"><span class="card-kicker">HERE FOR A GOOD TIME</span><strong>24<span>h</span></strong><span class="card-caption">A room with an end.</span></div>
           <div class="orbit-card card-hello"><span class="card-kicker">DROP IN, SAY</span><strong>hello<span>&#10035;</span></strong><span class="card-caption">No profiles needed.</span></div>
         </div>
-        <div class="home-foot"><span class="home-location"><span aria-hidden="true">&#9678;</span> Wherever you are</span><span>No sign-up. Just your people.</span><span>24 hours &middot; end-to-end encrypted</span></div>
+        <div class="home-foot"><span class="home-location"><span aria-hidden="true">&#9678;</span> Wherever you are</span><span>No sign-up. Just your people.</span><span>24-hour chats &middot; end-to-end encrypted</span></div>
       </section>
 
       <section class="room-view is-hidden" id="room-view">
@@ -51,7 +57,7 @@
             <button class="theme-toggle room-theme-toggle" id="room-theme-toggle" type="button" aria-label="Use dark mode" aria-pressed="false">Dark mode</button>
           </div>
           <div class="room-tools">
-            <div class="expiry-chip" title="This room automatically closes when the timer ends"><span class="expiry-icon" aria-hidden="true"></span><span><small>CLOSES IN</small><strong id="countdown">--:--</strong></span></div>
+            <div class="expiry-chip" title="This room automatically closes when the timer ends"><span class="expiry-icon" aria-hidden="true"></span><span><small>CHAT CLOSES IN</small><strong id="countdown">--:--</strong></span></div>
             <button class="button button-share" id="share-room" type="button"><span class="share-icon" aria-hidden="true">&#8599;</span> Invite</button>
             <button class="button button-delete" id="delete-room" type="button" disabled>Delete now</button>
           </div>
@@ -78,7 +84,7 @@
             <div class="composer-foot"><span><button type="button" id="encryption-info" class="encryption-info" aria-haspopup="dialog"><span id="encryption-status">Checking encryption...</span> <span aria-hidden="true">&#9432;</span></button></span><span>Enter to send <i>·</i> Shift + Enter for a new line</span></div>
           </div>
         </div>
-        <div class="room-footer"><span><span class="footer-lock" aria-hidden="true"></span> A private room, shared by link</span><span>Auto-deletes after 24 hours.</span></div>
+        <div class="room-footer"><span><span class="footer-lock" aria-hidden="true"></span> A private room, shared by link</span><span id="room-lifetime">Auto-deletes after 24 hours.</span></div>
       </section>
 
       <section class="expired-view is-hidden" id="expired-view">
@@ -87,6 +93,7 @@
         <h1>A good moment.<br>Now, a new one.</h1>
         <p class="intro">This temporary room has expired, so its conversation is no longer available.</p>
         <button class="button button-primary" id="new-room" type="button"><span>Start a new room</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+        <button id="reuse-room" class="button button-primary is-hidden" type="button">Start fresh with this link</button>
       </section>
     </main>
     <dialog id="encryption-dialog" class="delete-dialog" aria-labelledby="encryption-title">
@@ -99,7 +106,7 @@
     <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
       <h2 id="delete-title">Delete this chat for everyone?</h2>
       <p id="delete-description">This closes the room and deletes its messages and shared files. Everyone will be disconnected, and this invite link will stop working. You cannot undo this.</p>
-      <p class="delete-policy">Any joined guest can delete this temporary room.</p>
+      <p class="delete-policy">Any joined guest can delete this room. Deleting also permanently disables a reusable link.</p>
       <p id="delete-error" class="delete-error" role="alert"></p>
       <div class="dialog-actions"><button id="cancel-delete" class="button button-cancel" type="button" autofocus>Keep chatting</button><button id="confirm-delete" class="button button-danger" type="button">Delete for everyone</button></div>
     </dialog>

@@ -15,12 +15,14 @@ export default {
       if (Number(request.headers.get('Content-Length')) > 512) return json({ error: 'Invalid room configuration.' }, 400);
       let config;
       try { config = await request.json(); } catch { return json({ error: 'Encrypted room configuration required.' }, 400); }
-      if (config.encryptionVersion !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(config.keyCommitment || '') || Object.keys(config).some(key => !['encryptionVersion', 'keyCommitment'].includes(key))) return json({ error: 'Encrypted room configuration required.' }, 400);
-      const id = crypto.randomUUID().replaceAll('-', '');
+      if (!config || typeof config !== 'object' || Array.isArray(config) || config.encryptionVersion !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(config.keyCommitment || '') || Object.keys(config).some(key => !['encryptionVersion', 'keyCommitment', 'customName', 'reusable'].includes(key))) return json({ error: 'Encrypted room configuration required.' }, 400);
+      if (config.reusable !== undefined && typeof config.reusable !== 'boolean') return json({ error: 'Invalid reusable option.' }, 400);
+      if (config.customName !== undefined && (typeof config.customName !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(config.customName) || /^[a-f0-9]{32}$/.test(config.customName))) return json({ error: 'Use 3-40 lowercase letters, numbers or hyphens; start and end with a letter or number.' }, 400);
+      const id = config.customName || crypto.randomUUID().replaceAll('-', '');
       const stub = env.ROOMS.get(env.ROOMS.idFromName(id));
       return stub.fetch(new Request(`${url.origin}/initialize/${id}`, { method: 'POST', body: JSON.stringify(config) }));
     }
-    const match = url.pathname.match(/^\/api\/rooms\/([a-f0-9]{32})(\/.*)?$/);
+    const match = url.pathname.match(/^\/api\/rooms\/([a-z0-9][a-z0-9-]{1,38}[a-z0-9])(\/.*)?$/);
     if (!match) return json({ error: 'Not found.' }, 404);
     return env.ROOMS.get(env.ROOMS.idFromName(match[1])).fetch(request);
   }
@@ -71,15 +73,26 @@ export class ChatRoom extends DurableObject {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/initialize/') && request.method === 'POST') {
       return this.queue(async () => {
-        if (await this.metadata()) return json({ error: 'Already exists.' }, 409);
+        if (await this.metadata()) return json({ error: 'This link name is already taken. Choose another name.' }, 409);
         const config = await request.json();
-        const room = { encryptionVersion: 1, keyCommitment: config.keyCommitment, id: url.pathname.split('/').pop(), deadline: Date.now() + this.ttl(), nextGuest: 1, sequence: 0, bytes: 0 };
+        const room = { encryptionVersion: 1, reusable: config.reusable === true, keyCommitment: config.keyCommitment, id: url.pathname.split('/').pop(), sessionId: /^[a-f0-9]{32}$/.test(url.pathname.split('/').pop()) ? url.pathname.split('/').pop() : crypto.randomUUID().replaceAll('-', ''), deadline: Date.now() + this.ttl(), nextGuest: 1, sequence: 0, bytes: 0 };
         await this.ctx.storage.put('room', room);
         await this.ctx.storage.setAlarm(room.deadline);
-        return json({ roomId: room.id, encryptionVersion: 1, keyCommitment: room.keyCommitment, secondsRemaining: this.ttl() / 1000 }, 201);
+        return json({ roomId: room.id, reusable: room.reusable, encryptionContext: room.sessionId, encryptionVersion: 1, keyCommitment: room.keyCommitment, secondsRemaining: this.ttl() / 1000 }, 201);
       });
     }
-    const room = await this.metadata();
+    let room = await this.metadata();
+    if (room?.reusable && !room.deleted && !this.open(room) && request.method === 'GET' && url.pathname === `/api/rooms/${room.id}`) {
+      room = await this.queue(async () => {
+        const current = await this.metadata();
+        if (!current?.reusable || current.deleted || this.open(current)) return current;
+        await this.purge(current);
+        const next = { ...current, sessionId: crypto.randomUUID().replaceAll('-', ''), deadline: Date.now() + this.ttl(), nextGuest: 1, sequence: 0, bytes: 0 };
+        await this.ctx.storage.put('room', next);
+        await this.ctx.storage.setAlarm(next.deadline);
+        return next;
+      });
+    }
     if (!this.open(room)) return json({ error: 'This room has expired.' }, 404);
     const suffix = url.pathname.slice(`/api/rooms/${room.id}`.length);
     if (suffix === '' && request.method === 'DELETE') {
@@ -103,7 +116,7 @@ export class ChatRoom extends DurableObject {
         }
       });
     }
-    if (suffix === '' && request.method === 'GET') return json({ roomId: room.id, encryptionVersion: room.encryptionVersion || 0, keyCommitment: room.keyCommitment, secondsRemaining: Math.max(0, Math.ceil((room.deadline - Date.now()) / 1000)) });
+    if (suffix === '' && request.method === 'GET') return json({ roomId: room.id, reusable: room.reusable === true, encryptionContext: room.sessionId || room.id, encryptionVersion: room.encryptionVersion || 0, keyCommitment: room.keyCommitment, secondsRemaining: Math.max(0, Math.ceil((room.deadline - Date.now()) / 1000)) });
     if (room.encryptionVersion !== 1) return json({ error: 'This older room does not support encryption. Create a new encrypted room.' }, 409);
     if (suffix !== '/socket' && !await this.authorize(request.headers.get('X-Room-Access'), room)) return json({ error: 'A complete encrypted invite is required.' }, 403);
     if (suffix === '/messages' && request.method === 'GET') {
@@ -207,6 +220,8 @@ export class ChatRoom extends DurableObject {
       cursor = files.truncated ? files.cursor : undefined;
     } while (cursor);
     await this.ctx.storage.deleteAll();
+    // Keep names reserved: an expired or deleted invite must never be claimed by someone else.
+    if (room.reusable || !/^[a-f0-9]{32}$/.test(room.id)) await this.ctx.storage.put('room', { ...room, deadline: 0, nextGuest: 1, sequence: 0, bytes: 0 });
     await this.ctx.storage.deleteAlarm();
   }
   async alarm() {

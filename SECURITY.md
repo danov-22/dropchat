@@ -29,3 +29,9 @@ Each file gets a fresh random 256-bit AES-GCM key and 96-bit nonce. File associa
 Deploy client and Worker together, over HTTPS. Existing plaintext rooms are rejected by the encrypted protocol and expire on their original schedule; they are not retroactively encrypted. Start new rooms after upgrading. Never log invite fragments, room-access capabilities, session tokens or plaintext. Avoid URL-capturing analytics and third-party runtime scripts.
 
 `npm test` checks authenticated encryption and tamper rejection, encrypted group fan-out/history, encrypted file handling, room/access isolation, plaintext rejection, expiry and deletion. Local browser checks also exercised two-browser decryption, reload, file download, wrong/missing keys, invite correction, network payloads and the security dialog. These checks are not an independent cryptographic audit or a guarantee against implementation vulnerabilities. Obtain a specialist review before relying on this implementation for sensitive communications.
+
+## Reusable invites and custom names
+
+Custom names are public identifiers, not passwords. Access still requires the complete invite secret. Names remain reserved after deletion/expiry to prevent link takeover. A minimal reservation record remains on the server after chat content is removed.
+
+Reusable invites create a fresh empty chat when reopened after the preceding 24-hour chat expires. The encryption context is random for each new chat, giving a distinct derived message key and preventing ciphertext from a previous chat authenticating in the next. The shared root secret and access capability remain unchanged so the same invite works. This does not add forward secrecy: holders of the invite can join future chats and can decrypt previously captured ciphertext if they also have its public chat context. To exclude a previous invite holder, create a new room with a new secret. Manual room deletion permanently disables the reusable link.

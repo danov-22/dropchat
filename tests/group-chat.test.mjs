@@ -176,3 +176,60 @@ test('expiry and confirmed deletion remove encrypted history/files and revoke ev
     } finally { await mf.dispose(); }
   }
 });
+
+
+test('custom reusable invites reset history and keys per chat, reserve names and stay disabled after deletion', async () => {
+  const mf = runtime({ ROOM_TTL_SECONDS: '1' });
+  try {
+    const secret = generateRoomSecret(), access = await roomAccessToken(secret);
+    const config = { encryptionVersion: 1, keyCommitment: await roomCommitment(secret), customName: 'weekend-crew', reusable: true };
+    const make = body => mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    for (const customName of ['ab', '../escape', 'UPPER', 'ends-', 'a'.repeat(41), 'a'.repeat(32)]) assert.equal((await make({ ...config, customName })).status, 400);
+    assert.equal((await make({ ...config, reusable: 'yes' })).status, 400);
+    const created = await make(config);
+    assert.equal(created.status, 201);
+    const metadata = await created.json();
+    const room = { ...metadata, secret, access, key: await deriveRoomKey(secret, metadata.encryptionContext) };
+    assert.equal(room.roomId, 'weekend-crew');
+    const first = await join(mf, room);
+    const priorId = randomUUID();
+    const prior = { clientId: priorId, attachmentId: null, envelope: await encryptMessage(room.key, { roomId: room.encryptionContext, clientId: priorId, senderId: first.identity.participantId, sender: first.identity.displayName }, { text: 'old private chat', attachment: null }) };
+    assert.equal((await emit(first, prior)).ok, true);
+    const file = await upload(mf, room);
+    assert.equal((await make(config)).status, 409);
+    await new Promise(resolve => setTimeout(resolve, 1250));
+    const responses = await Promise.all([request(mf, room), request(mf, room)]);
+    const [next, concurrent] = await Promise.all(responses.map(r => r.json()));
+    assert.equal(next.reusable, true);
+    assert.equal(next.encryptionContext, concurrent.encryptionContext);
+    assert.notEqual(next.encryptionContext, room.roomId);
+    assert.equal(next.keyCommitment, config.keyCommitment);
+    assert.deepEqual((await (await request(mf, room, '/messages')).json()).messages, []);
+    assert.equal((await request(mf, room, `/files/${file.attachment.id}`)).status, 404);
+    assert.equal((await (await mf.getR2Bucket('FILES')).list()).objects.length, 0);
+    const key = await deriveRoomKey(secret, next.encryptionContext);
+    await assert.rejects(decryptMessage(key, next.encryptionContext, { ...prior, senderId: first.identity.participantId, sender: first.identity.displayName }));
+    const second = await join(mf, room);
+    const clientId = randomUUID();
+    const envelope = await encryptMessage(key, { roomId: next.encryptionContext, clientId, senderId: second.identity.participantId, sender: second.identity.displayName }, { text: 'fresh private chat', attachment: null });
+    assert.equal((await emit(second, { envelope, clientId, attachmentId: null })).ok, true);
+    const fresh = await second.next('chat:message');
+    assert.equal((await decryptMessage(key, next.encryptionContext, fresh)).text, 'fresh private chat');
+    assert.equal((await request(mf, room, '', { method: 'DELETE', headers: { 'X-Room-Session': second.token } })).status, 200);
+    assert.equal((await request(mf, room)).status, 404);
+    assert.equal((await make(config)).status, 409);
+    first.ws.close(); second.ws.close();
+  } finally { await mf.dispose(); }
+});
+
+test('custom one-time names remain reserved after expiry', async () => {
+  const mf = runtime({ ROOM_TTL_SECONDS: '1' });
+  try {
+    const body = JSON.stringify({ encryptionVersion: 1, keyCommitment: await roomCommitment(generateRoomSecret()), customName: 'one-time-room', reusable: false });
+    const make = () => mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    assert.equal((await make()).status, 201);
+    await new Promise(resolve => setTimeout(resolve, 1250));
+    assert.equal((await mf.dispatchFetch(`${origin}/api/rooms/one-time-room`)).status, 404);
+    assert.equal((await make()).status, 409);
+  } finally { await mf.dispose(); }
+});
