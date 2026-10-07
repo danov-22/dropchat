@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.wrangler/
+.env*
+.dev.vars*
+.npm-cache/
+.deploy-check/
+.visual-tools/
+.visual-check/

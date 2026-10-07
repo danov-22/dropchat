@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dropchat",
+  "main": "worker.js",
+  "compatibility_date": "2026-04-01",
+  "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
+  "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "ChatRoom" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatRoom"] }],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "dropchat-files" }]
+}

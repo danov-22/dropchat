@@ -1,0 +1,22 @@
+{
+  "name": "dropchat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "preview": "python -m http.server 4173 --directory dist",
+    "dev": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "test": "node --test tests/group-chat.test.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "wrangler": "^4.0.0",
+    "miniflare": "5.20261006.0-alpha"
+  },
+  "overrides": {
+    "sharp": "^0.35.5"
+  }
+}

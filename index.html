@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8f7f3">
+  <meta name="description" content="A private chat room that disappears when the conversation is over.">
+  <title>DropChat &mdash; good company, one link</title>
+  <link rel="icon" type="image/svg+xml" href="./logo.svg">
+  <script src="./theme.js"></script>
+  <link rel="preload" href="./fonts/bdo-grotesk-medium.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="./dropchat.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="wordmark" href="/" aria-label="DropChat home">
+        <img class="brand-logo" src="./logo.svg" width="23" height="23" alt="">
+        <span>dropchat</span>
+      </a>
+      <div class="topbar-actions"><button class="theme-toggle" id="theme-toggle" type="button" aria-label="Use dark mode" aria-pressed="false">Dark mode</button><div class="topbar-note"><svg class="moment-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="8.25"/><path d="M12 7.5V12l3 1.75"/></svg>Made for the moment</div></div>
+    </header>
+
+    <main id="app" class="app-main" aria-live="polite">
+      <section class="home-view" id="home-view">
+        <div class="home-copy">
+          <p class="eyebrow"><span class="eyebrow-dot"></span> A space for your people</p>
+          <h1>Good company.<br>One link.</h1>
+          <p class="intro">A temporary group chat for the conversations that happen in the moment. No accounts. Just your people.</p>
+          <button class="button button-primary create-button" id="create-room" type="button">
+            <span>Create a room</span><span class="button-arrow" aria-hidden="true">↗</span>
+          </button>
+          <p class="button-note" id="home-status">One link brings the whole group together.</p>
+        </div>
+        <div class="home-art" aria-hidden="true">
+          <div class="orbit-card card-plans"><span class="card-kicker">THE WEEKEND CREW</span><div class="card-drawing drawing-sun"><span></span></div><span class="card-caption">Same time, same people.</span></div>
+          <div class="orbit-card card-message"><span class="card-kicker">FRIDAY PLANS</span><span class="mini-message">Who's coming?</span><span class="mini-message reply">Count me in &#8599;</span><span class="card-caption">Everyone's here.</span></div>
+          <div class="orbit-card card-type"><span class="card-kicker">A LITTLE LESS SCROLLING</span><strong>More<br>talk.</strong><span class="card-caption">Just between us.</span></div>
+          <div class="orbit-card card-link"><span class="card-kicker">GOOD THINGS CONNECT</span><div class="card-drawing drawing-link"><span></span><span></span></div><span class="card-caption">One link. All of us.</span></div>
+          <div class="orbit-card card-time"><span class="card-kicker">HERE FOR A GOOD TIME</span><strong>24<span>h</span></strong><span class="card-caption">A room with an end.</span></div>
+          <div class="orbit-card card-hello"><span class="card-kicker">DROP IN, SAY</span><strong>hello<span>&#10035;</span></strong><span class="card-caption">No profiles needed.</span></div>
+        </div>
+        <div class="home-foot"><span class="home-location"><span aria-hidden="true">&#9678;</span> Wherever you are</span><span>No sign-up. Just your people.</span><span>24 hours &middot; not end-to-end encrypted</span></div>
+      </section>
+
+      <section class="room-view is-hidden" id="room-view">
+        <div class="room-heading">
+          <div>
+            <button id="leave-room" class="back-link" type="button"><span aria-hidden="true">←</span> Back</button>
+            <h1>Your group room<span class="title-period">.</span></h1>
+            <p class="room-subtitle">Share one link. Everyone joins the same group chat. This room won’t be here forever.</p>
+          </div>
+          <div class="room-tools">
+            <div class="expiry-chip"><span class="expiry-icon" aria-hidden="true"></span><span><small>ROOM CLOSES IN</small><strong id="countdown">--:--</strong></span></div>
+            <button class="button button-share" id="share-room" type="button"><span class="share-icon" aria-hidden="true">↗</span> Share invite</button>
+          </div>
+        </div>
+        <div class="chat-panel">
+          <div class="chat-toolbar">
+            <div class="presence"><span id="connection-dot" class="presence-dot"></span><span id="connection-label">Connecting</span></div>
+            <div class="room-code"><span>ROOM</span><code id="room-code">······</code></div>
+          </div>
+          <div class="group-presence"><strong id="participant-count">Connecting</strong><span id="participant-list" aria-live="polite"></span></div>
+          <div class="messages" id="messages" role="log" aria-label="Chat messages" aria-live="polite">
+            <div class="message-state" id="message-state"><span class="loading-mark"></span><p>Opening your room…</p></div>
+          </div>
+          <div class="composer-wrap">
+            <div class="upload-status is-hidden" id="upload-status" role="status"><span class="upload-filename" id="upload-filename"></span><span class="upload-percent" id="upload-percent">0%</span><div class="progress-track"><span id="upload-progress"></span></div><button type="button" id="cancel-upload" aria-label="Cancel upload">×</button></div>
+            <div class="attachment-pending is-hidden" id="attachment-pending"><span class="file-symbol" aria-hidden="true">↗</span><span id="pending-name"></span><button type="button" id="remove-attachment" aria-label="Remove attachment">×</button></div>
+            <form class="composer" id="message-form">
+              <input id="file-input" type="file" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,application/pdf,application/zip,text/plain,text/csv" hidden>
+              <button class="attach-button" id="attach-file" type="button" aria-label="Attach a file" title="Attach a file"><span aria-hidden="true">＋</span></button>
+              <label class="sr-only" for="message-input">Write a message</label>
+              <textarea id="message-input" rows="1" maxlength="4000" placeholder="Write a message…" autocomplete="off"></textarea>
+              <button class="send-button" id="send-message" type="submit" aria-label="Send message"><span aria-hidden="true">↑</span></button>
+            </form>
+            <div class="composer-foot"><span>Not end-to-end encrypted. Avoid sensitive information.</span><span>Enter to send <i>·</i> Shift + Enter for a new line</span></div>
+          </div>
+        </div>
+        <div class="room-footer"><span><span class="footer-lock" aria-hidden="true"></span> A private room, shared by link</span><span>Auto-deletes after 24 hours.</span></div>
+      </section>
+
+      <section class="expired-view is-hidden" id="expired-view">
+        <div class="expired-mark" aria-hidden="true"><span></span></div>
+        <p class="eyebrow">This room has closed</p>
+        <h1>A good moment.<br>Now, a new one.</h1>
+        <p class="intro">This temporary room has expired, so its conversation is no longer available.</p>
+        <button class="button button-primary" id="new-room" type="button"><span>Start a new room</span><span class="button-arrow" aria-hidden="true">↗</span></button>
+      </section>
+    </main>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </div>
+  <script type="module" src="./dropchat.js"></script>
+</body>
+</html>
