@@ -8,7 +8,8 @@
     "preview": "python -m http.server 4173 --directory dist",
     "dev": "npm run build && wrangler dev",
     "deploy": "npm run build && wrangler deploy",
-    "test": "node --test tests/group-chat.test.mjs"
+    "test": "node --test tests/group-chat.test.mjs",
+    "migrate:custom-links": "node scripts/migrate-custom-links.mjs"
   },
   "dependencies": {},
   "devDependencies": {

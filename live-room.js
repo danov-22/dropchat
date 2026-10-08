@@ -1,5 +1,5 @@
 // Small native WebSocket transport for the Cloudflare room protocol.
-export function connectRoom(roomId, accessToken) {
+export function connectRoom(roomId, accessToken, nickname = '') {
   const listeners = new Map();
   const pending = new Map();
   let stopped = false, retryTimer, retry = 0, ws;
@@ -46,7 +46,7 @@ export function connectRoom(roomId, accessToken) {
     const joinTimeout = setTimeout(() => ws.close(), 10000);
     ws.onopen = () => {
       notify('connect');
-      ws.send(JSON.stringify({ event: 'room:join', data: { token, accessToken } }));
+      ws.send(JSON.stringify({ event: 'room:join', data: { token, accessToken, nickname } }));
     };
     ws.onmessage = ({ data }) => {
       let packet;
@@ -63,7 +63,7 @@ export function connectRoom(roomId, accessToken) {
       transport.connected = false;
       rejectPending();
       if (stopped) return;
-      if (code === 4004) { stopped = true; notify(reason === 'Room deleted' ? 'room:deleted' : 'room:expired'); return; }
+      if (code === 4004) { stopped = true; notify(reason === 'Invite expired' ? 'room:link-expired' : reason === 'Room deleted' ? 'room:deleted' : 'room:expired'); return; }
       if (code === 4003) { stopped = true; notify('disconnect'); notify('chat:error', { message: reason }); return; }
       notify('disconnect');
       try {

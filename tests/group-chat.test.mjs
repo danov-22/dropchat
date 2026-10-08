@@ -1,3 +1,4 @@
+import { migrateCustomLinks } from '../scripts/migrate-custom-links.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Miniflare, convertV4MiniflareOptions, FormData } from 'miniflare';
@@ -5,8 +6,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, encryptMessage, decryptMessage, encryptAttachment, decryptAttachment, fromBase64, toBase64 } from '../encryption.js';
 
 const origin = 'https://dropchat.test';
-function runtime(bindings = {}) {
-  return new Miniflare(convertV4MiniflareOptions({ name: 'dropchat', modules: [{ type: 'ESModule', path: 'worker.js' }, { type: 'ESModule', path: 'protocol.js' }], compatibilityDate: '2026-04-01', durableObjects: { ROOMS: { className: 'ChatRoom', useSQLite: true } }, r2Buckets: ['FILES'], bindings }));
+function runtime(bindings = {}, legacy = false) {
+  return new Miniflare(convertV4MiniflareOptions({ name: 'dropchat', modules: [...(legacy ? [{ type: 'ESModule', path: 'tests/fixtures/legacy-worker.js' }] : []), { type: 'ESModule', path: 'worker.js' }, { type: 'ESModule', path: 'protocol.js' }], compatibilityDate: '2026-04-01', durableObjects: { ROOMS: { className: 'ChatRoom', useSQLite: true } }, r2Buckets: ['FILES'], bindings }));
 }
 function inbox(ws) {
   const packets = [], waiters = [];
@@ -28,16 +29,16 @@ async function create(mf) {
   const response = await mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ encryptionVersion: 1, keyCommitment: await roomCommitment(secret) }) });
   assert.equal(response.status, 201);
   const room = await response.json();
-  return { ...room, secret, access, key: await deriveRoomKey(secret, room.roomId) };
+  return { ...room, secret, access, key: await deriveRoomKey(secret, room.encryptionContext) };
 }
 function request(mf, room, suffix = '', init = {}) {
   return mf.dispatchFetch(`${origin}/api/rooms/${room.roomId}${suffix}`, { ...init, headers: { 'X-Room-Access': room.access, ...init.headers } });
 }
-async function join(mf, room, token = randomBytes(32).toString('hex'), accessToken = room.access) {
+async function join(mf, room, token = randomBytes(32).toString('hex'), accessToken = room.access, nickname = '') {
   const response = await request(mf, room, '/socket', { headers: { Upgrade: 'websocket', Origin: origin } });
   assert.equal(response.status, 101);
   const ws = response.webSocket, next = inbox(ws);
-  ws.send(JSON.stringify({ event: 'room:join', data: { token, accessToken } }));
+  ws.send(JSON.stringify({ event: 'room:join', data: { token, accessToken, nickname } }));
   return { ws, next, token, room, identity: await next('chat:ready') };
 }
 async function emit(client, data) {
@@ -46,12 +47,12 @@ async function emit(client, data) {
   return client.next('chat:ack', p => p.requestId === requestId);
 }
 async function wire(client, text, attachment = null, clientId = randomUUID()) {
-  const context = { roomId: client.room.roomId, clientId, senderId: client.identity.participantId, sender: client.identity.displayName };
+  const context = { roomId: client.room.encryptionContext, clientId, senderId: client.identity.participantId, sender: client.identity.displayName };
   const envelope = await encryptMessage(client.room.key, context, { text, attachment });
   return { envelope, clientId, attachmentId: attachment?.id || null };
 }
 async function upload(mf, room, content = 'private file contents', name = 'private-name.txt') {
-  const encrypted = await encryptAttachment(new File([content], name, { type: 'text/plain' }), room.roomId);
+  const encrypted = await encryptAttachment(new File([content], name, { type: 'text/plain' }), room.encryptionContext);
   const form = new FormData(); form.append('id', encrypted.attachment.id); form.append('file', encrypted.blob, 'encrypted.bin');
   const response = await request(mf, room, '/uploads', { method: 'POST', body: form });
   assert.equal(response.status, 201);
@@ -96,7 +97,7 @@ test('encrypted group chat preserves history, isolation, identity, presence and 
     const first = await a.next('chat:message');
     assert.equal((await b.next('chat:message')).id, first.id);
     assert.equal((await c.next('chat:message')).id, first.id);
-    assert.equal((await decryptMessage(room.key, room.roomId, first)).text, 'Never send this plaintext to the server');
+    assert.equal((await decryptMessage(room.key, room.encryptionContext, first)).text, 'Never send this plaintext to the server');
     assert.ok(!JSON.stringify(first).includes('Never send this plaintext'));
     assert.equal(first.text, undefined); assert.equal(first.attachment, undefined);
     assert.equal((await emit(a, packet)).ok, true);
@@ -104,13 +105,13 @@ test('encrypted group chat preserves history, isolation, identity, presence and 
     assert.equal(history.messages.length, 1);
     assert.deepEqual(history.messages[0].envelope, packet.envelope);
     assert.equal((await (await request(mf, other, '/messages')).json()).messages.length, 0);
-    await assert.rejects(decryptMessage(other.key, other.roomId, first));
+    await assert.rejects(decryptMessage(other.key, other.encryptionContext, first));
     const rejoined = await join(mf, room, a.token);
     assert.equal(rejoined.identity.participantId, a.identity.participantId);
     b.ws.close(1000, 'Leaving');
     await c.next('room:presence', p => p.participants.length === 2);
     assert.equal((await emit(c, await wire(c, 'Encrypted reply'))).ok, true);
-    assert.equal((await decryptMessage(room.key, room.roomId, await rejoined.next('chat:message', p => p.senderId === c.identity.participantId))).text, 'Encrypted reply');
+    assert.equal((await decryptMessage(room.key, room.encryptionContext, await rejoined.next('chat:message', p => p.senderId === c.identity.participantId))).text, 'Encrypted reply');
     assert.equal((await emit(outsider, { text: 'Plaintext rejected', clientId: randomUUID() })).ok, false);
     const invalidFile = await wire(outsider, 'Forged file'); invalidFile.attachmentId = randomUUID();
     assert.equal((await emit(outsider, invalidFile)).ok, false);
@@ -129,7 +130,7 @@ test('only encrypted files and complete-invite access are accepted; ciphertext h
     assert.ok(!response.headers.get('Content-Disposition').includes('private-name'));
     const bytes = await response.arrayBuffer();
     assert.ok(!new TextDecoder().decode(bytes).includes('private file contents'));
-    assert.equal(await (await decryptAttachment(bytes, file.attachment, room.roomId)).text(), 'private file contents');
+    assert.equal(await (await decryptAttachment(bytes, file.attachment, room.encryptionContext)).text(), 'private file contents');
     const bucket = await mf.getR2Bucket('FILES');
     const object = await bucket.get(`${room.roomId}/${file.attachment.id}`);
     assert.deepEqual(new Uint8Array(await object.arrayBuffer()), new Uint8Array(bytes));
@@ -232,4 +233,138 @@ test('custom one-time names remain reserved after expiry', async () => {
     assert.equal((await mf.dispatchFetch(`${origin}/api/rooms/one-time-room`)).status, 404);
     assert.equal((await make()).status, 409);
   } finally { await mf.dispose(); }
+});
+
+
+test('optional names persist across joins and name changes preserve authenticated message history', async () => {
+ const mf = runtime();
+ try {
+  const room = await create(mf);
+  assert.match(room.roomId, /^[a-f0-9]{16}$/);
+  const a = await join(mf, room, undefined, room.access, 'Dan');
+  assert.equal(a.identity.displayName, 'Dan');
+  const before = await wire(a, 'Before name change');
+  assert.equal((await emit(a, before)).ok, true);
+  const stored = await a.next('chat:message');
+  a.ws.close();
+  const b = await join(mf, room, a.token, room.access, 'Robin');
+  assert.equal(b.identity.participantId, a.identity.participantId);
+  assert.equal(b.identity.displayName, 'Robin');
+  assert.equal((await decryptMessage(room.key, room.encryptionContext, stored)).text, 'Before name change');
+  b.ws.close();
+  const c = await join(mf, room, a.token);
+  assert.match(c.identity.displayName, /^Guest /);
+  c.ws.close();
+  const response = await request(mf, room, '/socket', { headers: { Upgrade: 'websocket', Origin: origin } });
+  const socket = response.webSocket; socket.accept();
+  const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
+  socket.send(JSON.stringify({ event: 'room:join', data: { token: randomBytes(32).toString('hex'), accessToken: room.access, nickname: 'x'.repeat(31) } }));
+  assert.equal((await closed).code, 4003);
+ } finally { await mf.dispose(); }
+});
+
+
+test('custom reusable links have a fixed lifetime, release names, and reject old keys after recreation', async () => {
+ const mf = runtime({ ROOM_TTL_SECONDS: '1', CUSTOM_LINK_TTL_SECONDS: '3.5' });
+ try {
+  const secret = generateRoomSecret(), access = await roomAccessToken(secret);
+  const config = { encryptionVersion: 1, keyCommitment: await roomCommitment(secret), customName: 'monthly-crew', reusable: true };
+  const make = body => mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const first = await make(config); assert.equal(first.status, 201);
+  const room = { ...await first.json(), secret, access };
+  const deadline = room.linkExpiresAt;
+  assert.ok(deadline > Date.now() && deadline <= Date.now() + 3500);
+  const guest = await join(mf, room);
+  await upload(mf, room);
+  await new Promise(resolve => setTimeout(resolve, 1250));
+  const renewed = await (await request(mf, room)).json();
+  assert.equal(renewed.linkExpiresAt, deadline);
+  assert.notEqual(renewed.encryptionContext, room.encryptionContext);
+  await upload(mf, { ...room, encryptionContext: renewed.encryptionContext });
+  await new Promise(resolve => setTimeout(resolve, Math.max(0, deadline - Date.now()) + 250));
+  assert.equal((await request(mf, room)).status, 404);
+  assert.equal((await (await mf.getR2Bucket('FILES')).list()).objects.length, 0);
+  const freshSecret = generateRoomSecret();
+  const recreated = await make({ ...config, keyCommitment: await roomCommitment(freshSecret) });
+  assert.equal(recreated.status, 201);
+  const fresh = await recreated.json();
+  assert.notEqual(fresh.keyCommitment, room.keyCommitment);
+  assert.notEqual(fresh.encryptionContext, renewed.encryptionContext);
+  assert.ok(fresh.linkExpiresAt > deadline);
+  assert.equal((await request(mf, room, '/messages')).status, 403);
+  const response = await request(mf, room, '/socket', { headers: { Upgrade: 'websocket', Origin: origin } });
+  const ws = response.webSocket; ws.accept();
+  const closed = new Promise(resolve => ws.addEventListener('close', resolve, { once: true }));
+  ws.send(JSON.stringify({ event: 'room:join', data: { token: guest.token, accessToken: access } }));
+  assert.equal((await closed).code, 4003);
+  guest.ws.close();
+ } finally { await mf.dispose(); }
+});
+
+test('legacy dormant custom links receive a shared deadline and alarms even without visits', async () => {
+ const rollout = Date.now();
+ const migrationToken = 'migration-test-token-with-at-least-32-characters';
+ const mf = runtime({ CUSTOM_LINK_TTL_SECONDS: '2', CUSTOM_LINK_LEGACY_STARTED_AT: new Date(rollout).toISOString(), ROOM_MIGRATION_TOKEN: migrationToken }, true);
+ try {
+  const namespace = await mf.getDurableObjectNamespace('ROOMS');
+  const id = namespace.idFromName('forgotten-old-name');
+  const stub = namespace.get(id);
+  const secret = generateRoomSecret();
+  const legacy = { id: 'forgotten-old-name', encryptionVersion: 1, reusable: true, keyCommitment: await roomCommitment(secret), deadline: 0, nextGuest: 1, sequence: 0, bytes: 0 };
+  await stub.fetch(`${origin}/__fixture/seed`, { method: 'POST', body: JSON.stringify(legacy) });
+  const endpoint = `${origin}/api/maintenance/custom-links`;
+  assert.equal((await mf.dispatchFetch(endpoint, { method: 'POST', body: JSON.stringify({ id: id.toString() }) })).status, 404);
+  const migrate = () => mf.dispatchFetch(endpoint, { method: 'POST', headers: { Authorization: `Bearer ${migrationToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ id: id.toString() }) });
+  assert.equal((await migrate()).status, 200);
+  const first = await (await stub.fetch(`${origin}/__fixture/inspect`)).json();
+  assert.equal(first.room.linkExpiresAt, rollout + 2000);
+  assert.equal(first.alarm, rollout + 2000);
+  await migrate();
+  assert.equal((await (await stub.fetch(`${origin}/__fixture/inspect`)).json()).room.linkExpiresAt, first.room.linkExpiresAt);
+  await new Promise(resolve => setTimeout(resolve, Math.max(0, rollout + 2000 - Date.now()) + 300));
+  const after = await (await stub.fetch(`${origin}/__fixture/inspect`)).json();
+  assert.equal(after.count, 0); assert.equal(after.alarm, null);
+  const config = { encryptionVersion: 1, keyCommitment: await roomCommitment(generateRoomSecret()), customName: legacy.id, reusable: true };
+  assert.equal((await mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) })).status, 201);
+ } finally { await mf.dispose(); }
+});
+
+test('past-due legacy deleted names are released on creation and stale keys remain invalid', async () => {
+ const mf = runtime({ CUSTOM_LINK_TTL_SECONDS: '1', CUSTOM_LINK_LEGACY_STARTED_AT: new Date(Date.now() - 5000).toISOString() }, true);
+ try {
+  const namespace = await mf.getDurableObjectNamespace('ROOMS');
+  const stub = namespace.get(namespace.idFromName('old-deleted-name'));
+  const oldSecret = generateRoomSecret();
+  await stub.fetch(`${origin}/__fixture/seed`, { method: 'POST', body: JSON.stringify({ id: 'old-deleted-name', encryptionVersion: 1, reusable: true, deleted: true, keyCommitment: await roomCommitment(oldSecret), deadline: 0 }) });
+  const config = { encryptionVersion: 1, keyCommitment: await roomCommitment(generateRoomSecret()), customName: 'old-deleted-name', reusable: true };
+  const response = await mf.dispatchFetch(`${origin}/api/rooms`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
+  assert.equal(response.status, 201);
+  const room = await response.json();
+  assert.equal((await request(mf, { ...room, access: await roomAccessToken(oldSecret) }, '/messages')).status, 403);
+ } finally { await mf.dispose(); }
+});
+
+
+test('legacy migration enumerates dormant objects across pages and forwards only authenticated IDs', async () => {
+ const env = { CLOUDFLARE_ACCOUNT_ID: 'a'.repeat(32), CLOUDFLARE_API_TOKEN: 'private-cloudflare-token', ROOM_MIGRATION_TOKEN: 'm'.repeat(40), DROPCHAT_URL: 'https://dropchat.test' };
+ const objectIds = ['1'.repeat(64), '2'.repeat(64)];
+ const migrated = [], logs = [];
+ await migrateCustomLinks({ env, log: text => logs.push(text), fetchImpl: async (input, options) => {
+  const url = new URL(input);
+  if (url.origin === origin) {
+   assert.equal(options.headers.Authorization, `Bearer ${env.ROOM_MIGRATION_TOKEN}`);
+   assert.equal(url.pathname, '/api/maintenance/custom-links');
+   migrated.push(JSON.parse(options.body).id);
+   return Response.json({ custom: true });
+  }
+  assert.equal(url.origin, 'https://api.cloudflare.com');
+  assert.equal(options.headers.Authorization, `Bearer ${env.CLOUDFLARE_API_TOKEN}`);
+  if (url.pathname.endsWith('/namespaces')) return Response.json({ success: true, result: [{ id: 'b'.repeat(32), script: 'dropchat', class: 'ChatRoom' }], result_info: { total_pages: 1 } });
+  assert.ok(url.pathname.endsWith(`${'b'.repeat(32)}/objects`));
+  return url.searchParams.has('cursor') ? Response.json({ success: true, result: [{ id: objectIds[1], hasStoredData: true }], result_info: {} }) : Response.json({ success: true, result: [{ id: objectIds[0], hasStoredData: true }, { id: '3'.repeat(64), hasStoredData: false }], result_info: { cursor: 'page-two' } });
+ } });
+ assert.deepEqual(migrated, objectIds);
+ assert.ok(logs.at(-1).includes('Migration complete'));
+ assert.ok(!logs.join('').includes(env.ROOM_MIGRATION_TOKEN));
+ assert.ok(!logs.join('').includes(env.CLOUDFLARE_API_TOKEN));
 });

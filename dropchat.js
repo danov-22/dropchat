@@ -40,10 +40,44 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   let deleting = false;
   const toast = document.getElementById("toast");
 
+  // Keep the most recent invite only in this tab. Never send its key to the relay.
+  let lastInvite = null;
+  let preferredName = '';
+  try { lastInvite = sessionStorage.getItem('dropchat-last-invite'); preferredName = sessionStorage.getItem('dropchat-name') || ''; } catch (_) {}
+  const nameInput = document.getElementById('display-name');
+  nameInput.value = preferredName;
+  function saveName(value) {
+    preferredName = value.trim();
+    nameInput.value = preferredName;
+    try { sessionStorage.setItem('dropchat-name', preferredName); } catch (_) {}
+  }
+  function parseInvite(value) {
+    const url = new URL(value, location.origin);
+    if (url.origin !== location.origin || url.pathname !== '/') throw new Error('Use a complete invite for this DropChat site.');
+    const compact = url.hash.slice(1).match(/^([a-z0-9][a-z0-9-]{1,38}[a-z0-9])\.([A-Za-z0-9_-]{43})$/);
+    const id = compact?.[1] || url.searchParams.get('room');
+    const secret = compact?.[2] || new URLSearchParams(url.hash.slice(1)).get('key');
+    if (!/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(id || '')) throw new Error('Paste a valid room invite.');
+    return { id, secret };
+  }
+  function compactInvite(id, secret) { return `${location.origin}/#${id}.${secret}`; }
+  function rememberInvite(id, secret) {
+    lastInvite = compactInvite(id, secret);
+    try { sessionStorage.setItem('dropchat-last-invite', lastInvite); } catch (_) {}
+    updateRejoin();
+  }
+  function updateRejoin() {
+    let valid = false;
+    try { valid = Boolean(lastInvite && parseInvite(lastInvite).secret); } catch (_) {}
+    document.getElementById('rejoin-room').classList.toggle('is-hidden', !valid);
+    document.getElementById('rejoin-note').classList.toggle('is-hidden', !valid);
+  }
+  updateRejoin();
   const MAX_FILE_SIZE = 25 * 1024 * 1024;
   let roomId = null;
   let encryptionContext = null;
   let reusableRoom = false;
+  let linkDeadline = 0;
   let roomKey = null;
   let roomAccess = null;
   let receiveQueue = Promise.resolve();
@@ -56,6 +90,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   let socket = null;
   let roomDeadline = 0;
   let countdownTimer = null;
+  let linkExpiryTimer = null;
   let toastTimer = null;
   let activeUpload = null;
   let selectedFile = null;
@@ -63,9 +98,20 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   const seenMessages = new Set();
 
   // The API tells us how many seconds remain; use that value as the clock baseline.
+  function watchLinkExpiry() {
+    clearTimeout(linkExpiryTimer);
+    if (!linkDeadline) return;
+    // Browsers cap setTimeout near 24.8 days; a 30-day invite needs a second hop.
+    linkExpiryTimer = window.setTimeout(() => {
+      if (Date.now() >= linkDeadline) showExpired('link-expired');
+      else watchLinkExpiry();
+    }, Math.min(Math.max(1, linkDeadline - Date.now()), 2147483647));
+  }
+
   function setRoomDeadline(room) {
     const seconds = Number(room.secondsRemaining);
     roomDeadline = Date.now() + Math.max(0, seconds) * 1000;
+    watchLinkExpiry();
     renderCountdown();
     clearInterval(countdownTimer);
     countdownTimer = window.setInterval(renderCountdown, 1000);
@@ -78,7 +124,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     const minutes = Math.floor((secondsLeft % 3600) / 60);
     const seconds = secondsLeft % 60;
     countdown.textContent = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-    if (secondsLeft === 0) showExpired();
+    if (secondsLeft === 0) showExpired(linkDeadline && Date.now() >= linkDeadline ? 'link-expired' : 'expired');
   }
 
   function updateViewport() {
@@ -134,6 +180,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
       document.getElementById('custom-name').focus();
       return;
     }
+    saveName(nameInput.value);
     createButton.disabled = true;
     createButton.querySelector("span:first-child").textContent = "Making your room…";
     homeStatus.textContent = "A moment while we set things up.";
@@ -142,7 +189,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
       const keyCommitment = await roomCommitment(secret);
       const room = await apiRequest("/api/rooms", { method: "POST", headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ encryptionVersion: 1, keyCommitment, reusable, ...(customName ? { customName } : {}) }) });
       if (!room.roomId) throw new Error("The server did not return a room link.");
-      history.pushState({}, "", `/?room=${encodeURIComponent(room.roomId)}#key=${secret}`);
+      history.pushState({}, "", compactInvite(room.roomId, secret));
       await openRoom(room.roomId, room);
     } catch (error) {
       homeStatus.textContent = error.message || "Could not create a room. Please try again.";
@@ -156,6 +203,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   async function openRoom(id, knownRoom = null) {
     cleanupRoom();
     reusableRoom = false;
+    linkDeadline = 0;
     document.getElementById('reuse-room').classList.add('is-hidden');
     const currentGeneration = generation;
     roomId = id;
@@ -178,12 +226,15 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
       if (generation !== currentGeneration) return;
       if (room.encryptionVersion !== 1) { showRoomIssue('This room predates encryption. Create a new room to start an encrypted conversation.'); return; }
       reusableRoom = room.reusable === true;
+      linkDeadline = room.linkExpiresAt || 0;
+      const linkExpiryText = linkDeadline ? `This custom invite expires on ${new Date(linkDeadline).toLocaleString()}. Its name becomes available again. A new invite key will be required.` : 'This invite has no separate 30-day custom-name deadline.';
+      document.getElementById('link-expiry-info').textContent = linkExpiryText;
       encryptionContext = room.encryptionContext || id;
-      document.querySelector('.expiry-chip').title = reusableRoom ? 'This chat clears when the timer ends. Reopen the same invite to start a fresh chat.' : 'This room automatically closes when the timer ends';
-      document.getElementById('room-lifetime').textContent = reusableRoom ? 'Chat clears after 24 hours. This invite can be reused.' : 'Auto-deletes after 24 hours.';
+      document.querySelector('.expiry-chip').title = reusableRoom ? `This chat clears when the timer ends. ${linkExpiryText}` : 'This room automatically closes when the timer ends';
+      document.getElementById('room-lifetime').textContent = reusableRoom ? (linkDeadline ? '24-hour chats. This custom invite lasts 30 days.' : 'Chat clears after 24 hours. This invite can be reused.') : 'Auto-deletes after 24 hours.';
       document.querySelector('.room-subtitle').textContent = reusableRoom ? 'One invite. Fresh chats every 24 hours.' : 'A temporary room for your people.';
       roomCode.textContent = /^[a-f0-9]{32}$/.test(id) ? `${id.slice(0, 6)}...${id.slice(-4)}` : id;
-      const secret = new URLSearchParams(location.hash.slice(1)).get('key');
+      const secret = parseInvite(location.href).secret;
       if (!secret) { showRoomIssue('This invite is missing its encryption key. Ask someone in the room to share the complete invite link, including the part after #.'); return; }
       try {
         if (await roomCommitment(secret) !== room.keyCommitment) throw new Error('Wrong key');
@@ -193,6 +244,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
         roomKey = key;
         roomAccess = access;
       } catch (_) { if (generation === currentGeneration) showRoomIssue('This invite has an invalid encryption key, or this browser cannot use encryption. Open the complete invite on HTTPS with a supported browser.'); return; }
+      rememberInvite(id, secret);
       document.getElementById('encryption-status').textContent = 'End-to-end encrypted';
       setRoomDeadline(room || knownRoom);
       if (!expired) connectSocket(id);
@@ -226,7 +278,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
 
   // Rejoin the shared room and refresh missed history on each native WebSocket connection.
   function connectSocket(id) {
-    socket = connectRoom(id, roomAccess);
+    socket = connectRoom(id, roomAccess, preferredName);
     socket.on("connect", () => setConnection("connecting", "Joining room"));
     socket.on("chat:ready", (payload) => {
       displayName = payload.displayName;
@@ -244,7 +296,8 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
       document.getElementById("participant-list").textContent = participants.map(p => p.id === participantId ? `${p.name} (you)` : p.name).join(", ");
     });
     socket.on("chat:message", (message) => addMessage(message));
-    socket.on("room:expired", () => showExpired());
+    socket.on("room:expired", (payload) => showExpired(payload?.linkExpired ? "link-expired" : "expired"));
+    socket.on("room:link-expired", () => showExpired("link-expired"));
     socket.on("room:deleted", () => showExpired("deleted"));
     socket.on("chat:error", (payload) => {
       if (payload && payload.message) showToast(payload.message);
@@ -318,6 +371,9 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     hideMessageState();
     const row = document.createElement("article");
     row.className = "message-row";
+    let colorHash = 0;
+    for (const char of (message.senderId || 'guest')) colorHash = (colorHash * 31 + char.charCodeAt(0)) >>> 0;
+    row.dataset.color = String(colorHash % 6);
     row.dataset.sequence = String(message.sequence || 0);
     if (participantId && message.senderId === participantId) row.classList.add("own");
 
@@ -407,6 +463,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   }
 
   function cleanupRoom() {
+    if (document.getElementById('name-dialog').open) document.getElementById('name-dialog').close();
     if (deleteDialog.open) deleteDialog.close();
     document.getElementById("encryption-dialog").close();
     deleting = false;
@@ -436,6 +493,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
       activeUpload = null;
     }
     clearInterval(countdownTimer);
+    clearTimeout(linkExpiryTimer);
     roomDeadline = 0;
     selectedFile = null;
     messageInput.value = "";
@@ -456,8 +514,12 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   }
 
   function showExpired(reason = "expired") {
-    if (expired) return;
+    if (expired && reason !== 'link-expired') return;
     expired = true;
+    if (reason === 'deleted' || reason === 'link-expired' || !reusableRoom) {
+      try { if (lastInvite && parseInvite(lastInvite).id === roomId) { lastInvite = null; sessionStorage.removeItem('dropchat-last-invite'); } } catch (_) {}
+      updateRejoin();
+    }
     cleanupRoom();
     // Remove already-rendered copies as soon as the room is closed.
     messages.replaceChildren();
@@ -467,15 +529,21 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     expiredView.querySelector('.intro').textContent = reason === 'deleted'
       ? 'This room was deleted for everyone. Its conversation is no longer available, and the invite link no longer works.'
       : 'This temporary room has expired, so its conversation is no longer available.';
-    const canReuse = reusableRoom && reason !== 'deleted';
+    const canReuse = reusableRoom && reason !== 'deleted' && reason !== 'link-expired';
+    if (reason === 'link-expired') {
+      expiredView.querySelector('.eyebrow').textContent = 'This custom invite has expired';
+      expiredView.querySelector('.intro').textContent = 'Its 30-day lifetime has ended. The chat and invite have been deleted, and the name can be created again with a new encryption key. Your old invite cannot open the new room.';
+    }
     document.getElementById('reuse-room').classList.toggle('is-hidden', !canReuse);
+    if (canReuse) watchLinkExpiry();
     if (canReuse) expiredView.querySelector('.intro').textContent = 'This chat has expired and its history is gone. Your invite still works: start a fresh 24-hour chat with the same link.';
     setConnection("disconnected", "Room closed");
     showState("expired");
   }
 
   async function shareInvite() {
-    const url = window.location.href;
+    const parsed = parseInvite(location.href);
+    const url = compactInvite(parsed.id, parsed.secret);
     try {
       if (navigator.share) await navigator.share({ title: "Join my DropChat room", url });
       else if (navigator.clipboard && window.isSecureContext) {
@@ -670,6 +738,35 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     }
   });
 
+  document.getElementById('rejoin-room').addEventListener('click', () => {
+    if (!lastInvite) return;
+    saveName(nameInput.value);
+    history.pushState({}, '', lastInvite);
+    routeFromUrl();
+  });
+  document.getElementById('join-invite-form').addEventListener('submit', event => {
+    event.preventDefault();
+    try {
+      const invite = parseInvite(document.getElementById('join-invite').value.trim());
+      if (!invite.secret) throw new Error('The full invite must include its encryption key after #.');
+      saveName(nameInput.value);
+      history.pushState({}, '', compactInvite(invite.id, invite.secret));
+      routeFromUrl();
+    } catch (error) { homeStatus.textContent = error.message; }
+  });
+  document.getElementById('edit-name').addEventListener('click', () => {
+    document.getElementById('chat-name').value = preferredName;
+    document.getElementById('name-dialog').showModal();
+  });
+  document.getElementById('cancel-name').addEventListener('click', () => document.getElementById('name-dialog').close());
+  document.getElementById('name-form').addEventListener('submit', event => {
+    event.preventDefault();
+    const name = document.getElementById('chat-name').value.trim();
+    if (name.length > 30 || /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(name)) { showToast('Use up to 30 characters without control characters.'); return; }
+    saveName(name);
+    document.getElementById('name-dialog').close();
+    openRoom(roomId);
+  });
   document.getElementById('reuse-room').addEventListener('click', () => openRoom(roomId));
   createButton.addEventListener("click", createRoom);
   newRoomButton.addEventListener("click", () => {
@@ -709,20 +806,19 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     if (activeUpload) activeUpload.abort();
   });
   function routeFromUrl() {
-    const requestedRoom = new URLSearchParams(window.location.search).get("room");
-    if (/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(requestedRoom || "")) openRoom(requestedRoom);
+    let requestedRoom;
+    try { requestedRoom = parseInvite(location.href).id; } catch (_) {}
+    if (requestedRoom) openRoom(requestedRoom);
     else {
       cleanupRoom();
       roomId = null;
       expired = false;
-      showState("home");
+      showState('home');
+      updateRejoin();
     }
   }
   window.addEventListener("popstate", routeFromUrl);
   window.addEventListener("hashchange", routeFromUrl);
 
-  // A malformed or absent room link lands on the simple create-room home state.
-  const initialRoomId = new URLSearchParams(window.location.search).get("room");
-  if (/^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(initialRoomId || "")) openRoom(initialRoomId);
-  else showState("home");
+  routeFromUrl();
 })();

@@ -28,14 +28,21 @@
           <h1>Good company.<br>One link.</h1>
           <p class="intro">An encrypted group chat for the conversations that happen in the moment. No accounts. Just your people.</p>
           <div class="invite-options">
+            <label for="display-name">Your name <span>(optional)</span></label>
+            <input id="display-name" type="text" maxlength="30" placeholder="How should we call you?" autocomplete="nickname">
             <label for="custom-name">Custom link name <span>(optional)</span></label>
             <input id="custom-name" type="text" maxlength="40" pattern="[a-z0-9][a-z0-9-]{1,38}[a-z0-9]" placeholder="weekend-crew" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="invite-help">
             <label class="reusable-option"><input id="reusable-link" type="checkbox"> Reuse this link for future chats</label>
-            <p id="invite-help">3-40 letters, numbers or hyphens. Reusable links start a fresh, empty 24-hour chat when reopened after expiry. Keep the complete encrypted invite.</p>
+            <p id="invite-help">3-40 letters, numbers or hyphens. Reusable links start a fresh, empty 24-hour chat when reopened after expiry. Keep the complete encrypted invite. The name alone cannot open a chat. Custom links expire permanently after 30 days, then their names can be created again with new invite keys. Lost keys cannot be recovered.</p>
           </div>
           <button class="button button-primary create-button" id="create-room" type="button">
             <span>Create a room</span><span class="button-arrow" aria-hidden="true">↗</span>
           </button>
+          <div class="return-options">
+            <button id="rejoin-room" class="button button-cancel is-hidden" type="button">Rejoin your chat</button>
+            <p id="rejoin-note" class="is-hidden">Your latest invite is remembered in this tab until you close it.</p>
+            <form id="join-invite-form"><label for="join-invite">Have an invite?</label><div class="join-invite-row"><input id="join-invite" type="text" placeholder="Paste the complete invite link" autocomplete="off" spellcheck="false" required><button class="button button-cancel" type="submit">Join</button></div></form>
+          </div>
           <p class="button-note" id="home-status">One link brings the whole group together.</p>
         </div>
         <div class="home-art" aria-hidden="true">
@@ -52,8 +59,9 @@
       <section class="room-view is-hidden" id="room-view">
         <header class="room-heading">
           <div class="room-identity">
-            <button id="leave-room" class="back-link" type="button" aria-label="Leave room" title="Leave room"><span aria-hidden="true">&#8592;</span></button>
+            <button id="leave-room" class="back-link" type="button" aria-label="Back to home" title="Back to home. You can rejoin this chat."><span aria-hidden="true">&#8592;</span></button>
             <div class="room-title"><h1>Group chat</h1><p class="room-subtitle">A temporary room for your people.</p></div>
+            <button class="theme-toggle" id="edit-name" type="button">Your name</button>
             <button class="theme-toggle room-theme-toggle" id="room-theme-toggle" type="button" aria-label="Use dark mode" aria-pressed="false">Dark mode</button>
           </div>
           <div class="room-tools">
@@ -96,17 +104,27 @@
         <button id="reuse-room" class="button button-primary is-hidden" type="button">Start fresh with this link</button>
       </section>
     </main>
+    <dialog id="name-dialog" class="delete-dialog" aria-labelledby="name-title">
+      <form id="name-form">
+        <h2 id="name-title">Your name in this chat</h2>
+        <label for="chat-name">Name (optional, up to 30 characters)</label>
+        <input id="chat-name" type="text" maxlength="30" autocomplete="nickname">
+        <p>Leave empty to use your Guest name. Names are visible to the server and are not verified identities.</p>
+        <div class="dialog-actions"><button id="cancel-name" class="button button-cancel" type="button">Cancel</button><button class="button button-primary" type="submit">Save name</button></div>
+      </form>
+    </dialog>
     <dialog id="encryption-dialog" class="delete-dialog" aria-labelledby="encryption-title">
       <h2 id="encryption-title">Encrypted in your browser.</h2>
       <p>Messages, shared files and filenames are encrypted before they leave your device. They are decrypted on devices with the complete invite link.</p>
       <p>Keep the full invite private. Anyone with it can read this room's history and share it with others. Lost keys cannot be recovered.</p>
+      <p id="link-expiry-info">Custom invites last 30 days. Their names become available again after expiry.</p>
       <p class="delete-policy">Guest identities are not verified. The server can still see connection details, guest labels, timing and encrypted sizes. If the room key is exposed, it can unlock past messages in this room. This design has not had an independent security audit.</p>
       <div class="dialog-actions"><button id="close-encryption-info" class="button button-cancel" type="button" autofocus>Got it</button></div>
     </dialog>
     <dialog id="delete-dialog" class="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-description">
       <h2 id="delete-title">Delete this chat for everyone?</h2>
       <p id="delete-description">This closes the room and deletes its messages and shared files. Everyone will be disconnected, and this invite link will stop working. You cannot undo this.</p>
-      <p class="delete-policy">Any joined guest can delete this room. Deleting also permanently disables a reusable link.</p>
+      <p class="delete-policy">Any joined guest can delete this room. Deleting disables this invite. A custom name stays reserved until its 30-day deadline, then can be created again with a new key.</p>
       <p id="delete-error" class="delete-error" role="alert"></p>
       <div class="dialog-actions"><button id="cancel-delete" class="button button-cancel" type="button" autofocus>Keep chatting</button><button id="confirm-delete" class="button button-danger" type="button">Delete for everyone</button></div>
     </dialog>

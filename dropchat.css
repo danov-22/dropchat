@@ -306,3 +306,48 @@ body.is-chat-room .room-footer { display: none; }
 .room-code code { overflow-wrap: anywhere; }
 
 @media (max-width: 760px) { .home-view { padding-bottom: 350px; } }
+
+/* Chat identity colors retain dark readable text in both themes. */
+.message-row[data-color="0"] { --guest-bubble: #e7e1f6; }
+.message-row[data-color="1"] { --guest-bubble: #d9eaf1; }
+.message-row[data-color="2"] { --guest-bubble: #f2e2cf; }
+.message-row[data-color="3"] { --guest-bubble: #e1ebd3; }
+.message-row[data-color="4"] { --guest-bubble: #f3dfe5; }
+.message-row[data-color="5"] { --guest-bubble: #d5ebe4; }
+.message-row:not(.own) .message-bubble { background: var(--guest-bubble, #e7e1f6); color: #24252b; }
+.message-row.own .message-bubble { background: #355d4b; color: #fff; }
+[data-theme="dark"] .message-row.own .message-bubble { background: #b5d9c3; color: #17291f; }
+.card-time strong { display: flex; align-items: baseline; gap: 9px; letter-spacing: -.055em; white-space: nowrap; }
+.card-time strong span { letter-spacing: 0; }
+.card-kicker, .card-caption { flex-shrink: 0; overflow-wrap: normal; }
+.card-drawing { flex-shrink: 0; }
+.drawing-link { width: 130px; align-self: center; }
+.drawing-link span:first-child { left: 10px; }
+.drawing-link span:last-child { right: 10px; }
+.mini-message { max-width: 100%; flex-shrink: 0; }
+@media (min-width: 961px) {
+  .home-view { min-height: 1320px; padding: 70px 0 140px; }
+  .home-copy { width: min(44vw, 480px); }
+  .home-art { inset: 0 0 100px; }
+  .orbit-card { width: clamp(150px, 14vw, 190px); height: 240px; padding: 18px 14px; }
+  .card-plans { top: 5%; left: 3%; }
+  .card-message { top: 5%; right: 3%; }
+  .card-type { top: 39%; left: 0; }
+  .card-time { top: 39%; right: 0; }
+  .card-link { bottom: 5%; left: 3%; }
+  .card-hello { bottom: 5%; right: 3%; }
+  .card-type strong { font-size: 44px; }
+  .card-hello strong { font-size: 38px; }
+}
+#display-name, #chat-name, #join-invite { width: 100%; padding: 12px 15px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--ink); font: 16px var(--sans); }
+#display-name { margin-bottom: 16px; }
+#chat-name { margin: 10px 0 16px; }
+.return-options { width: min(100%, 370px); margin: 20px auto 0; }
+#rejoin-room { width: 100%; }
+#rejoin-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
+#join-invite-form { text-align: left; margin-top: 20px; }
+#join-invite-form label { display: block; margin-bottom: 8px; font-size: 15px; }
+.join-invite-row { display: flex; gap: 8px; }
+.join-invite-row input { min-width: 0; }
+.join-invite-row .button { padding: 0 18px; min-height: 46px; }
+#edit-name { flex-shrink: 0; padding: 0 12px; }

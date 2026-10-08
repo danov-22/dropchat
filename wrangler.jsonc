@@ -3,6 +3,7 @@
   "name": "dropchat",
   "main": "worker.js",
   "compatibility_date": "2026-04-01",
+  "vars": { "CUSTOM_LINK_LEGACY_STARTED_AT": "2026-10-09T00:00:00+08:00" },
   "assets": { "directory": "./dist", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
   "durable_objects": { "bindings": [{ "name": "ROOMS", "class_name": "ChatRoom" }] },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatRoom"] }],

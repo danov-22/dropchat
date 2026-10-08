@@ -2,6 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { MAX_FILE_SIZE, UUID, validEnvelope } from './protocol.js';
 
 const TTL = 24 * 60 * 60 * 1000;
+const CUSTOM_LINK_TTL = 30 * TTL;
 const MAX_FILE = MAX_FILE_SIZE + 16;
 const json = (data, status = 200) => Response.json(data, { status, headers: { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' } });
 
@@ -11,6 +12,14 @@ export default {
     if (!url.pathname.startsWith('/api/')) return env.ASSETS.fetch(request);
     const origin = request.headers.get('Origin');
     if (origin && origin !== url.origin) return json({ error: 'Untrusted origin.' }, 403);
+    if (request.method === 'POST' && url.pathname === '/api/maintenance/custom-links') {
+      if (!env.ROOM_MIGRATION_TOKEN || env.ROOM_MIGRATION_TOKEN.length < 32 || request.headers.get('Authorization') !== `Bearer ${env.ROOM_MIGRATION_TOKEN}`) return json({ error: 'Not found.' }, 404);
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'Invalid object ID.' }, 400); }
+      if (!/^[a-f0-9]{64}$/.test(body?.id || '')) return json({ error: 'Invalid object ID.' }, 400);
+      try { return await env.ROOMS.get(env.ROOMS.idFromString(body.id)).fetch(new Request(`${url.origin}/maintenance/custom-links`, { method: 'POST' })); }
+      catch { return json({ error: 'Migration failed; retry this object.' }, 503); }
+    }
     if (request.method === 'POST' && url.pathname === '/api/rooms') {
       if (Number(request.headers.get('Content-Length')) > 512) return json({ error: 'Invalid room configuration.' }, 400);
       let config;
@@ -18,7 +27,7 @@ export default {
       if (!config || typeof config !== 'object' || Array.isArray(config) || config.encryptionVersion !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(config.keyCommitment || '') || Object.keys(config).some(key => !['encryptionVersion', 'keyCommitment', 'customName', 'reusable'].includes(key))) return json({ error: 'Encrypted room configuration required.' }, 400);
       if (config.reusable !== undefined && typeof config.reusable !== 'boolean') return json({ error: 'Invalid reusable option.' }, 400);
       if (config.customName !== undefined && (typeof config.customName !== 'string' || !/^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])$/.test(config.customName) || /^[a-f0-9]{32}$/.test(config.customName))) return json({ error: 'Use 3-40 lowercase letters, numbers or hyphens; start and end with a letter or number.' }, 400);
-      const id = config.customName || crypto.randomUUID().replaceAll('-', '');
+      const id = config.customName || crypto.randomUUID().replaceAll('-', '').slice(0, 16);
       const stub = env.ROOMS.get(env.ROOMS.idFromName(id));
       return stub.fetch(new Request(`${url.origin}/initialize/${id}`, { method: 'POST', body: JSON.stringify(config) }));
     }
@@ -32,6 +41,7 @@ export class ChatRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.serial = Promise.resolve();
+    ctx.blockConcurrencyWhile(async () => { await this.ensurePolicy(); });
   }
   // Keep read/modify/write operations ordered even across storage awaits.
   queue(task) {
@@ -51,7 +61,36 @@ export class ChatRoom extends DurableObject {
     } catch (_) { return false; }
   }
   async metadata() { return this.ctx.storage.get('room'); }
-  open(room) { return room && room.deadline > Date.now(); }
+  isCustom(room) { return room && (room.custom === true || (room.custom === undefined && !/^[a-f0-9]{32}$/.test(room.id))); }
+  linkTtl() { const seconds = Number(this.env.CUSTOM_LINK_TTL_SECONDS); return seconds > 0 ? Math.min(seconds * 1000, CUSTOM_LINK_TTL) : CUSTOM_LINK_TTL; }
+  async ensurePolicy() {
+    const room = await this.metadata();
+    if (!this.isCustom(room) || room.linkExpiresAt) return room;
+    // Older versions did not store creation time. One fixed rollout date prevents
+    // forgotten objects receiving a new 30-day lease whenever they are discovered.
+    const rollout = Date.parse(this.env.CUSTOM_LINK_LEGACY_STARTED_AT || '2026-10-09T00:00:00+08:00');
+    if (!Number.isFinite(rollout)) throw new Error('Invalid legacy custom-link rollout date.');
+    room.custom = true;
+    room.createdAt = room.createdAt || rollout;
+    room.linkExpiresAt = room.createdAt + this.linkTtl();
+    if (room.deadline > 0) room.deadline = Math.min(room.deadline, room.linkExpiresAt);
+    await this.ctx.storage.put('room', room);
+    const due = room.deadline > 0 ? Math.min(room.deadline, room.linkExpiresAt) : room.linkExpiresAt;
+    await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, due));
+    return room;
+  }
+  async prepare() {
+    const room = await this.ensurePolicy();
+    if (this.isCustom(room) && room.linkExpiresAt <= Date.now()) {
+      // Revoke access even if physical file cleanup needs an alarm retry.
+      await this.ctx.storage.setAlarm(Date.now() + 1000);
+      await this.purge(room, true);
+      return null;
+    }
+    return room;
+  }
+  open(room) { return room && room.deadline > Date.now() && (!room.linkExpiresAt || room.linkExpiresAt > Date.now()); }
+  sameRoom(current, previous) { return this.open(current) && current.keyCommitment === previous.keyCommitment && current.sessionId === previous.sessionId; }
   send(ws, event, data) {
     try { ws.send(JSON.stringify({ event, data })); } catch (_) {}
   }
@@ -73,21 +112,24 @@ export class ChatRoom extends DurableObject {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/initialize/') && request.method === 'POST') {
       return this.queue(async () => {
-        if (await this.metadata()) return json({ error: 'This link name is already taken. Choose another name.' }, 409);
+        if (await this.prepare()) return json({ error: 'This link name is already taken. Choose another name.' }, 409);
         const config = await request.json();
-        const room = { encryptionVersion: 1, reusable: config.reusable === true, keyCommitment: config.keyCommitment, id: url.pathname.split('/').pop(), sessionId: /^[a-f0-9]{32}$/.test(url.pathname.split('/').pop()) ? url.pathname.split('/').pop() : crypto.randomUUID().replaceAll('-', ''), deadline: Date.now() + this.ttl(), nextGuest: 1, sequence: 0, bytes: 0 };
+        const room = { encryptionVersion: 1, custom: Boolean(config.customName), reusable: config.reusable === true, keyCommitment: config.keyCommitment, id: url.pathname.split('/').pop(), sessionId: /^[a-f0-9]{32}$/.test(url.pathname.split('/').pop()) ? url.pathname.split('/').pop() : crypto.randomUUID().replaceAll('-', ''), deadline: Date.now() + this.ttl(), nextGuest: 1, sequence: 0, bytes: 0 };
+        room.createdAt = Date.now();
+        if (room.custom) { room.linkExpiresAt = room.createdAt + this.linkTtl(); room.deadline = Math.min(room.deadline, room.linkExpiresAt); }
         await this.ctx.storage.put('room', room);
         await this.ctx.storage.setAlarm(room.deadline);
-        return json({ roomId: room.id, reusable: room.reusable, encryptionContext: room.sessionId, encryptionVersion: 1, keyCommitment: room.keyCommitment, secondsRemaining: this.ttl() / 1000 }, 201);
+        return json({ roomId: room.id, reusable: room.reusable, linkExpiresAt: room.linkExpiresAt || null, encryptionContext: room.sessionId, encryptionVersion: 1, keyCommitment: room.keyCommitment, secondsRemaining: Math.max(0, Math.ceil((room.deadline - Date.now()) / 1000)) }, 201);
       });
     }
-    let room = await this.metadata();
+    if (url.pathname === '/maintenance/custom-links' && request.method === 'POST') return this.queue(async () => { const room = await this.prepare(); return json({ processed: true, custom: Boolean(this.isCustom(room)), linkExpiresAt: room?.linkExpiresAt || null }); });
+    let room = await this.queue(() => this.prepare());
     if (room?.reusable && !room.deleted && !this.open(room) && request.method === 'GET' && url.pathname === `/api/rooms/${room.id}`) {
       room = await this.queue(async () => {
         const current = await this.metadata();
-        if (!current?.reusable || current.deleted || this.open(current)) return current;
+        if (!current?.reusable || current.deleted || this.open(current) || (current.linkExpiresAt && current.linkExpiresAt <= Date.now())) return current;
         await this.purge(current);
-        const next = { ...current, sessionId: crypto.randomUUID().replaceAll('-', ''), deadline: Date.now() + this.ttl(), nextGuest: 1, sequence: 0, bytes: 0 };
+        const next = { ...current, sessionId: crypto.randomUUID().replaceAll('-', ''), deadline: Math.min(Date.now() + this.ttl(), current.linkExpiresAt || Infinity), nextGuest: 1, sequence: 0, bytes: 0 };
         await this.ctx.storage.put('room', next);
         await this.ctx.storage.setAlarm(next.deadline);
         return next;
@@ -116,12 +158,12 @@ export class ChatRoom extends DurableObject {
         }
       });
     }
-    if (suffix === '' && request.method === 'GET') return json({ roomId: room.id, reusable: room.reusable === true, encryptionContext: room.sessionId || room.id, encryptionVersion: room.encryptionVersion || 0, keyCommitment: room.keyCommitment, secondsRemaining: Math.max(0, Math.ceil((room.deadline - Date.now()) / 1000)) });
+    if (suffix === '' && request.method === 'GET') return json({ roomId: room.id, reusable: room.reusable === true, linkExpiresAt: room.linkExpiresAt || null, encryptionContext: room.sessionId || room.id, encryptionVersion: room.encryptionVersion || 0, keyCommitment: room.keyCommitment, secondsRemaining: Math.max(0, Math.ceil((room.deadline - Date.now()) / 1000)) });
     if (room.encryptionVersion !== 1) return json({ error: 'This older room does not support encryption. Create a new encrypted room.' }, 409);
     if (suffix !== '/socket' && !await this.authorize(request.headers.get('X-Room-Access'), room)) return json({ error: 'A complete encrypted invite is required.' }, 403);
     if (suffix === '/messages' && request.method === 'GET') {
       const stored = await this.ctx.storage.list({ prefix: 'message:' });
-      if (!this.open(await this.metadata())) return json({ error: 'This room has closed.' }, 404);
+      if (!this.sameRoom(await this.metadata(), room)) return json({ error: 'This room has closed.' }, 404);
       return json({ messages: [...stored.values()] });
     }
     if (suffix === '/socket' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
@@ -141,7 +183,7 @@ export class ChatRoom extends DurableObject {
       if (!(file instanceof File) || file.size < 17 || file.size > MAX_FILE || file.type !== 'application/octet-stream' || file.name !== 'encrypted.bin' || !UUID.test(id || '')) return json({ error: 'Only encrypted attachments are accepted (maximum 25 MB plus encryption tag).' }, 400);
       return this.queue(async () => {
         const current = await this.metadata();
-        if (!this.open(current)) return json({ error: 'This room has expired.' }, 404);
+        if (!this.sameRoom(current, room)) return json({ error: 'This room has expired.' }, 404);
         if (current.bytes + file.size > 100 * 1024 * 1024) return json({ error: 'This room has reached its 100 MB upload limit.' }, 413);
         if (await this.ctx.storage.get(`file:${id}`)) return json({ error: 'Attachment already exists.' }, 409);
         const key = `${room.id}/${id}`;
@@ -158,14 +200,14 @@ export class ChatRoom extends DurableObject {
       const meta = await this.ctx.storage.get(`file:${id}`);
       if (!meta) return json({ error: 'File not found.' }, 404);
       const object = await this.env.FILES.get(`${room.id}/${id}`);
-      if (!object || !this.open(await this.metadata())) return json({ error: 'File not found.' }, 404);
+      if (!object || !this.sameRoom(await this.metadata(), room)) return json({ error: 'File not found.' }, 404);
       return new Response(object.body, { headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': String(meta.size), 'Content-Disposition': 'attachment; filename="encrypted.bin"', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; sandbox" } });
     }
     return json({ error: 'Not found.' }, 404);
   }
   async webSocketMessage(ws, raw) {
     return this.queue(async () => {
-      const room = await this.metadata();
+      const room = await this.prepare();
       if (!this.open(room)) { this.send(ws, 'room:expired', {}); ws.close(4004, 'Room expired'); return; }
       if (room.encryptionVersion !== 1) { this.send(ws, 'chat:error', { message: 'Create a new encrypted room.' }); ws.close(4003, 'Encryption required'); return; }
       if (typeof raw !== 'string' || raw.length > 48000) { ws.close(1009, 'Message too large'); return; }
@@ -174,6 +216,8 @@ export class ChatRoom extends DurableObject {
       const identity = ws.deserializeAttachment();
       if (packet.event === 'room:join' && !identity.participantId) {
         if (!await this.authorize(packet.data?.accessToken, room)) { ws.close(4003, 'A complete encrypted invite is required.'); return; }
+        const nickname = packet.data?.nickname;
+        if (nickname !== undefined && (typeof nickname !== 'string' || nickname.trim().length > 30 || /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(nickname))) { ws.close(4003, 'Use a name of up to 30 characters without control characters.'); return; }
         const token = packet.data?.token;
         if (!/^[a-f0-9]{64}$/.test(token || '')) { ws.close(1008, 'Invalid session'); return; }
         // Store a hash so the private reconnect token is never broadcast or persisted raw.
@@ -185,12 +229,16 @@ export class ChatRoom extends DurableObject {
           await this.ctx.storage.put(`participant:${digest}`, participant);
           await this.ctx.storage.put('room', room);
         }
-        ws.serializeAttachment({ ...participant, lastSent: 0 });
+        participant.guestName ||= participant.name;
+        participant.name = nickname?.trim() || participant.guestName;
+        await this.ctx.storage.put(`participant:${digest}`, participant);
+        ws.serializeAttachment({ ...participant, roomSession: room.sessionId || room.id, lastSent: 0 });
         this.send(ws, 'chat:ready', { ...participant, displayName: participant.name });
         this.presence();
         return;
       }
       if (packet.event !== 'chat:send' || !identity.participantId) return;
+      if (identity.roomSession && identity.roomSession !== (room.sessionId || room.id)) { ws.close(4004, 'Room expired'); return; }
       const fail = (error) => this.send(ws, 'chat:ack', { requestId: packet.requestId, ok: false, error });
       const { envelope, attachmentId = null, clientId } = packet.data || {};
       if (!UUID.test(clientId || '') || !validEnvelope(envelope) || Object.keys(packet.data).some(key => !['envelope', 'attachmentId', 'clientId'].includes(key))) return fail('Only encrypted messages are accepted.');
@@ -209,9 +257,9 @@ export class ChatRoom extends DurableObject {
   }
   webSocketClose(ws, code, reason) { ws.close(code, reason); this.presence(ws); }
   webSocketError(ws) { ws.close(1011, 'Connection error'); this.presence(ws); }
-  async purge(room) {
-    this.broadcast(room.deleted ? 'room:deleted' : 'room:expired', {});
-    for (const ws of this.ctx.getWebSockets()) ws.close(4004, room.deleted ? 'Room deleted' : 'Room expired');
+  async purge(room, release = false) {
+    this.broadcast(room.deleted ? 'room:deleted' : 'room:expired', { linkExpired: release });
+    for (const ws of this.ctx.getWebSockets()) ws.close(4004, release ? 'Invite expired' : room.deleted ? 'Room deleted' : 'Room expired');
     // List by prefix also catches uploads orphaned by a failed metadata write.
     let cursor;
     do {
@@ -220,13 +268,15 @@ export class ChatRoom extends DurableObject {
       cursor = files.truncated ? files.cursor : undefined;
     } while (cursor);
     await this.ctx.storage.deleteAll();
-    // Keep names reserved: an expired or deleted invite must never be claimed by someone else.
-    if (room.reusable || !/^[a-f0-9]{32}$/.test(room.id)) await this.ctx.storage.put('room', { ...room, deadline: 0, nextGuest: 1, sequence: 0, bytes: 0 });
-    await this.ctx.storage.deleteAlarm();
+    // Keep custom reservations only until their fixed 30-day deadline.
+    const retain = !release && (room.reusable || this.isCustom(room));
+    if (retain) await this.ctx.storage.put('room', { ...room, deadline: 0, nextGuest: 1, sequence: 0, bytes: 0 });
+    if (retain && room.linkExpiresAt) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, room.linkExpiresAt));
+    else await this.ctx.storage.deleteAlarm();
   }
   async alarm() {
     return this.queue(async () => {
-      const room = await this.metadata();
+      const room = await this.prepare();
       if (!room) return;
       if (this.open(room)) { await this.ctx.storage.setAlarm(room.deadline); return; }
       await this.purge(room);
