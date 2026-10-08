@@ -66,7 +66,8 @@
           </div>
           <div class="room-tools">
             <div class="expiry-chip" title="This room automatically closes when the timer ends"><span class="expiry-icon" aria-hidden="true"></span><span><small>CHAT CLOSES IN</small><strong id="countdown">--:--</strong></span></div>
-            <button class="button button-share" id="share-room" type="button"><span class="share-icon" aria-hidden="true">&#8599;</span> Invite</button>
+            <button class="button button-copy" id="copy-room" type="button" aria-label="Copy complete encrypted invite link"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M15 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h3"/></svg><span id="copy-room-label">Copy link</span></button>
+            <button class="button button-share" id="share-room" aria-label="Share invite" type="button"><span class="share-icon" aria-hidden="true">&#8599;</span><span class="invite-label">Invite</span></button>
             <button class="button button-delete" id="delete-room" type="button" disabled>Delete now</button>
           </div>
         </header>
@@ -104,6 +105,13 @@
         <button id="reuse-room" class="button button-primary is-hidden" type="button">Start fresh with this link</button>
       </section>
     </main>
+    <dialog id="copy-dialog" class="delete-dialog" aria-labelledby="copy-title">
+      <h2 id="copy-title">Copy your invite</h2>
+      <p>Automatic copying is unavailable. Select and copy the complete link below. Keep it private: it includes your encryption key.</p>
+      <label for="copy-invite-value">Complete invite link</label>
+      <input id="copy-invite-value" type="text" readonly spellcheck="false" autocomplete="off">
+      <div class="dialog-actions"><button id="select-invite" class="button button-cancel" type="button">Select link</button><button id="close-copy" class="button button-primary" type="button">Done</button></div>
+    </dialog>
     <dialog id="name-dialog" class="delete-dialog" aria-labelledby="name-title">
       <form id="name-form">
         <h2 id="name-title">Your name in this chat</h2>

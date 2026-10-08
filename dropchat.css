@@ -351,3 +351,14 @@ body.is-chat-room .room-footer { display: none; }
 .join-invite-row input { min-width: 0; }
 .join-invite-row .button { padding: 0 18px; min-height: 46px; }
 #edit-name { flex-shrink: 0; padding: 0 12px; }
+
+.button-copy { min-height: 40px; padding: 0 13px; gap: 6px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); font-size: 14px; white-space: nowrap; }
+.button-copy svg { width: 17px; height: 17px; flex-shrink: 0; }
+#copy-invite-value { width: 100%; margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); color: var(--ink); font: 15px var(--mono); }
+@media (max-width: 760px) { .button-copy { min-height: 36px; font-size: 13px; padding: 0 10px; } }
+@media (max-width: 400px) {
+  .invite-label { display: none; }
+  body.is-chat-room .button-share { padding: 0 10px; gap: 0; }
+  body.is-chat-room .button-delete, .button-copy { padding: 0 8px; }
+  .button-copy { gap: 4px; }
+}

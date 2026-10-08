@@ -92,6 +92,7 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   let countdownTimer = null;
   let linkExpiryTimer = null;
   let toastTimer = null;
+  let copyLabelTimer = null;
   let activeUpload = null;
   let selectedFile = null;
   let expired = false;
@@ -463,6 +464,10 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
   }
 
   function cleanupRoom() {
+    clearTimeout(copyLabelTimer);
+    document.getElementById('copy-room-label').textContent = 'Copy link';
+    document.getElementById('copy-dialog').close();
+    document.getElementById('copy-invite-value').value = '';
     if (document.getElementById('name-dialog').open) document.getElementById('name-dialog').close();
     if (deleteDialog.open) deleteDialog.close();
     document.getElementById("encryption-dialog").close();
@@ -541,27 +546,58 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     showState("expired");
   }
 
-  async function shareInvite() {
+  function inviteToCopy() {
     const parsed = parseInvite(location.href);
-    const url = compactInvite(parsed.id, parsed.secret);
+    if (!roomKey || !parsed.secret || expired) throw new Error('Open a valid encrypted room before copying its invite.');
+    return compactInvite(parsed.id, parsed.secret);
+  }
+
+  async function copyInvite() {
+    let url;
+    try { url = inviteToCopy(); }
+    catch (error) { showToast(error.message); return; }
+    const currentGeneration = generation;
+    let copied = false;
     try {
-      if (navigator.share) await navigator.share({ title: "Join my DropChat room", url });
-      else if (navigator.clipboard && window.isSecureContext) {
+      if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(url);
-        showToast("Invite link copied.");
-      } else {
-        const temporary = document.createElement("textarea");
-        temporary.value = url;
-        temporary.style.position = "fixed";
-        temporary.style.opacity = "0";
-        document.body.append(temporary);
-        temporary.select();
-        const copied = document.execCommand("copy");
-        temporary.remove();
-        showToast(copied ? "Invite link copied." : "Copy this link from your address bar.");
+        copied = true;
       }
+    } catch (_) { /* Fall back when clipboard permission is denied. */ }
+    if (generation !== currentGeneration) return;
+    if (!copied) {
+      const temporary = document.createElement('textarea');
+      temporary.value = url;
+      temporary.style.position = 'fixed';
+      temporary.style.opacity = '0';
+      const previousFocus = document.activeElement;
+      document.body.append(temporary);
+      temporary.select();
+      try { copied = document.execCommand('copy'); } catch (_) {}
+      temporary.remove();
+      previousFocus?.focus();
+    }
+    if (copied) {
+      showToast('Invite link copied.');
+      document.getElementById('copy-room-label').textContent = 'Copied!';
+      clearTimeout(copyLabelTimer);
+      copyLabelTimer = window.setTimeout(() => { document.getElementById('copy-room-label').textContent = 'Copy link'; }, 2500);
+    } else {
+      const field = document.getElementById('copy-invite-value');
+      field.value = url;
+      document.getElementById('copy-dialog').showModal();
+      field.focus();
+      field.select();
+    }
+  }
+
+  async function shareInvite() {
+    try {
+      const url = inviteToCopy();
+      if (navigator.share) await navigator.share({ title: 'Join my DropChat room', url });
+      else await copyInvite();
     } catch (error) {
-      if (error && error.name !== "AbortError") showToast("Could not share the invite link.");
+      if (error?.name !== 'AbortError') showToast(error.message || 'Could not share the invite link.');
     }
   }
 
@@ -776,6 +812,10 @@ import { generateRoomSecret, roomAccessToken, roomCommitment, deriveRoomKey, enc
     showState("home");
     homeStatus.textContent = "One link brings the whole group together.";
   });
+  document.getElementById('copy-room').addEventListener('click', copyInvite);
+  document.getElementById('close-copy').addEventListener('click', () => document.getElementById('copy-dialog').close());
+  document.getElementById('copy-dialog').addEventListener('close', () => { document.getElementById('copy-invite-value').value = ''; });
+  document.getElementById('select-invite').addEventListener('click', () => { const field = document.getElementById('copy-invite-value'); field.focus(); field.select(); });
   shareButton.addEventListener("click", shareInvite);
   leaveButton.addEventListener("click", () => {
     cleanupRoom();
